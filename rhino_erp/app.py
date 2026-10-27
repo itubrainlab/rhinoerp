@@ -16,9 +16,6 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import matplotlib
-
-matplotlib.use("QtAgg")
-
 import mne
 import numpy as np
 import pyqtgraph as pg
