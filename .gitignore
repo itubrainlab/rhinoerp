@@ -1,0 +1,9 @@
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/
+*-ave.fif
+# Local analyses of participant data stay out of the repository.
+analysis/

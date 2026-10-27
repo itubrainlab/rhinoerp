@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rhinoerp"
+dynamic = ["version"]
+description = "Offline ERP analysis of EEG recordings (BDF/EDF) with g.Pype and MNE"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "gpype[gui]>=4.1,<5",
+    "mne>=1.8",
+    "matplotlib>=3.7",
+    "PySide6>=6.10.1,<6.12",
+    "pyqtgraph>=0.13.3",
+]
+keywords = ["eeg", "erp", "mne", "gpype", "unicorn", "bdf"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pyedflib>=0.1.38"]
+
+[project.gui-scripts]
+rhino-erp = "rhino_erp.app:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "rhino_erp.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["rhino_erp*"]
+
+[tool.setuptools.package-data]
+rhino_erp = ["resources/*.svg"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

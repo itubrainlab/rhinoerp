@@ -1,0 +1,82 @@
+import mne
+import numpy as np
+import pytest
+from scipy.signal import butter, sosfiltfilt, tf2sos
+
+from rhino_erp import processing as P
+
+
+@pytest.fixture(scope="module")
+def raw(recording):
+    return P.load_bdf(str(recording[0]))
+
+
+@pytest.fixture(scope="module")
+def prepared(raw):
+    rows = P.default_channel_setup(raw)
+    include = [n for n, selected, _, _ in rows if selected]
+    channels, _ = P.apply_channel_setup(
+        raw, include, {n: k for n, _, k, _ in rows}, {n: e for n, _, _, e in rows})
+    return P.apply_filter(channels, P.FilterSettings(0.1, 30, 50, 4))
+
+
+def test_default_channels_are_the_unicorn_eight(raw):
+    rows = P.default_channel_setup(raw)
+    assert [r[3] for r in rows[:8]] == list(P.UNICORN_LABELS)
+    assert all(r[1] and r[2] == "eeg" for r in rows[:8])
+    assert all(not r[1] and r[2] == "misc" for r in rows[8:])
+
+
+def test_trigger_channel_events(raw, recording):
+    assert P.guess_trigger_channel(raw) == "TRIG"
+    events, event_id = P.find_events(raw, "TRIG")
+    assert events[:, 2].tolist() == recording[1]
+    assert event_id == {"20": 20, "30": 30}
+    # Same events as MNE's own reader once the channel is typed as stim.
+    stim = raw.copy()
+    stim.set_channel_types({"TRIG": "stim"}, verbose="error")
+    stim.apply_function(lambda x: np.round(x), picks="TRIG")  # as the exported script does
+    expected = mne.find_events(stim, "TRIG", shortest_event=1, consecutive=True,
+                               verbose="error")
+    assert np.array_equal(events, expected)
+
+
+def test_gpype_filter_is_zero_phase_butterworth(raw):
+    x = raw.get_data(picks=["EEG 1", "EEG 6"])
+    sf = raw.info["sfreq"]
+    out = P.gpype_filter(x, sf, ["a", "b"], P.FilterSettings(0.1, 30, 50, 4))
+    expected = (x - x.mean(axis=1, keepdims=True)).astype(np.float32)
+    for order, band, kind in ((4, [0.1, 30], "bandpass"), (2, [48, 52], "bandstop")):
+        b, a = butter(order, np.array(band) / (sf / 2), kind)
+        expected = sosfiltfilt(tf2sos(b, a), expected, axis=1).astype(np.float32)
+    assert np.array_equal(out, expected)
+
+
+def test_shift_and_group_events():
+    events = np.array([[100, 0, 21], [200, 0, 31], [300, 0, 20]])
+    shifted = P.shift_events(events, 40, 250)
+    assert shifted[:, 0].tolist() == [110, 210, 310]
+    grouped, event_id = P.group_events(shifted, {"pooled": [21, 31], "other": [20]})
+    assert event_id["other"] == 20
+    assert (grouped[:, 2] == event_id["pooled"]).sum() == 2
+
+
+def test_reference_average_sums_to_zero(prepared):
+    referenced = P.apply_reference(prepared, P.REF_AVERAGE)
+    assert np.abs(referenced.get_data(picks="eeg").sum(axis=0)).max() < 1e-12
+
+
+def test_statistics_find_the_simulated_n170(raw, prepared):
+    events, _ = P.find_events(raw, "TRIG")
+    epochs, evokeds = P.compute_erps(prepared, events, {"20": 20, "30": 30},
+                                     P.EpochSettings(-0.2, 0.6, (None, 0.0), None))
+    assert set(evokeds) == {"20", "30"}
+    result = P.compare_conditions(epochs, "30", "20", P.COMPONENT_PRESETS["N170"],
+                                  n_perm=1000)
+    assert result.component.channels == ("PO7", "PO8")
+    assert result.diff < -4 and result.p_welch < 0.001 and result.p_perm < 0.01
+    assert abs(result.a.peak_latency - 0.17) < 0.012 and not result.a.peak_at_edge
+    # Same seed, same permutation p.
+    again = P.compare_conditions(epochs, "30", "20", P.COMPONENT_PRESETS["N170"],
+                                 n_perm=1000)
+    assert again.p_perm == result.p_perm

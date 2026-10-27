@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Rhino Recorder's rhino, now inspecting the data through a monocle. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1fb5a8"/>
+      <stop offset="1" stop-color="#3b4bc8"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="1" x2="0.3" y2="0">
+      <stop offset="0" stop-color="#f5b700"/>
+      <stop offset="1" stop-color="#ffe98a"/>
+    </linearGradient>
+    <linearGradient id="skin" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#aab3bd"/>
+      <stop offset="1" stop-color="#8a939d"/>
+    </linearGradient>
+    <radialGradient id="glass" cx="0.35" cy="0.3" r="0.8">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.75"/>
+      <stop offset="0.5" stop-color="#e8f6ff" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#bfe3ff" stop-opacity="0.25"/>
+    </radialGradient>
+  </defs>
+
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#bg)"/>
+
+  <!-- Everything stays inside the tile: Qt's SVG renderer has no clipping. -->
+  <g>
+    <!-- An ERP trace across the sky: baseline, N1 dip, P300 hump -->
+    <path d="M 26 64 L 54 64 C 60 64, 62 78, 68 78 C 74 78, 76 40, 86 40
+             C 96 40, 98 64, 108 64 L 120 64"
+          fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round"
+          stroke-linejoin="round" opacity="0.9"/>
+
+    <!-- Rainbow wig, behind the head -->
+    <g fill="none" stroke-linecap="round" stroke-width="11">
+      <path d="M 192 104 C 214 118, 222 150, 218 200" stroke="#ff6b9a"/>
+      <path d="M 200 100 C 224 114, 234 148, 230 204" stroke="#ffd23f"/>
+      <path d="M 208 98 C 234 110, 246 146, 242 206" stroke="#4dd4e8"/>
+      <path d="M 186 110 C 204 126, 208 156, 204 196" stroke="#9b7bff"/>
+    </g>
+
+    <!-- Head and neck -->
+    <path d="M 52 196
+             C 40 190, 34 172, 40 156
+             C 46 140, 62 128, 84 120
+             C 104 112, 128 104, 150 100
+             C 170 96, 188 98, 200 110
+             L 212 150
+             C 220 180, 216 214, 204 246
+             L 118 246
+             C 116 224, 104 208, 84 204
+             C 70 203, 60 201, 52 196 Z"
+          fill="url(#skin)" stroke="#555d67" stroke-width="4" stroke-linejoin="round"/>
+
+    <!-- Ear -->
+    <ellipse cx="190" cy="92" rx="13" ry="24" transform="rotate(28 190 92)"
+             fill="#9aa3ad" stroke="#555d67" stroke-width="4"/>
+    <ellipse cx="190" cy="94" rx="6" ry="14" transform="rotate(28 190 94)" fill="#d9a7b4"/>
+
+    <!-- The rhino's own horns -->
+    <path d="M 44 154 C 38 136, 42 118, 56 104 C 58 122, 62 136, 70 146 Z"
+          fill="#e6dcc8" stroke="#8a7d66" stroke-width="3" stroke-linejoin="round"/>
+    <path d="M 86 126 C 86 116, 90 108, 96 102 C 98 110, 100 117, 104 122 Z"
+          fill="#e6dcc8" stroke="#8a7d66" stroke-width="3" stroke-linejoin="round"/>
+
+    <!-- The unicorn horn, strapped on -->
+    <path d="M 126 108 L 108 18 L 156 100 Z" fill="url(#gold)" stroke="#c98a00"
+          stroke-width="3" stroke-linejoin="round"/>
+    <g stroke="#d99a00" stroke-width="3" stroke-linecap="round" fill="none">
+      <path d="M 122.8 91.8 Q 134 88 143.5 78.7"/>
+      <path d="M 119.2 73.8 Q 127 70 133.9 62.3"/>
+      <path d="M 115.6 55.8 Q 120 52 124.3 45.9"/>
+      <path d="M 112.0 37.8 Q 113.5 34 114.7 29.5"/>
+    </g>
+    <path d="M 154 103 Q 162 160 140 222" fill="none" stroke="#ff4f9a"
+          stroke-width="4" stroke-linecap="round"/>
+
+    <!-- Face -->
+    <ellipse cx="96" cy="184" rx="11" ry="6" fill="#ff9fc0" opacity="0.6"/>
+    <ellipse cx="54" cy="177" rx="4" ry="3" fill="#555d67"/>
+    <path d="M 54 196 Q 70 195 86 189" fill="none" stroke="#555d67" stroke-width="3"
+          stroke-linecap="round"/>
+
+    <!-- Raised, scrutinising eyebrow -->
+    <path d="M 98 116 Q 118 104 140 114" fill="none" stroke="#3b424a" stroke-width="6"
+          stroke-linecap="round"/>
+
+    <!-- Monocle chain, hanging from the rim down the neck -->
+    <path d="M 138 166 C 150 186, 146 206, 160 230" fill="none" stroke="#c98a00"
+          stroke-width="4" stroke-linecap="round" stroke-dasharray="1 7"/>
+    <path d="M 138 166 C 150 186, 146 206, 160 230" fill="none" stroke="#ffd54a"
+          stroke-width="2.5" stroke-linecap="round" stroke-dasharray="1 7"/>
+
+    <!-- Eye, magnified behind the lens -->
+    <circle cx="119" cy="146" r="22" fill="url(#glass)"/>
+    <ellipse cx="119" cy="147" rx="12" ry="11" fill="#ffffff" stroke="#555d67" stroke-width="2"/>
+    <circle cx="117" cy="148" r="6.5" fill="#222222"/>
+    <circle cx="115" cy="145.5" r="2.2" fill="#ffffff"/>
+
+    <!-- The monocle: thick gold rim, glass glint -->
+    <circle cx="119" cy="146" r="25" fill="none" stroke="#8a5a00" stroke-width="11"/>
+    <circle cx="119" cy="146" r="25" fill="none" stroke="url(#gold)" stroke-width="7"/>
+    <path d="M 102 136 A 19 19 0 0 1 116 127" fill="none" stroke="#ffffff"
+          stroke-width="4" stroke-linecap="round" opacity="0.9"/>
+    <circle cx="139" cy="162" r="4" fill="url(#gold)" stroke="#8a5a00" stroke-width="2"/>
+  </g>
+</svg>
