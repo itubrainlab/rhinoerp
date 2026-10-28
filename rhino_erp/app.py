@@ -234,7 +234,16 @@ class MainWindow(QMainWindow):
                                 "(extended Infomax, EEG channels only) and inspect them "
                                 "in the ICA tab.")
         self.btn_ica.clicked.connect(self.fit_ica)
-        lay.addWidget(self.btn_ica)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Components"))
+        self.spn_ncomp = QSpinBox()
+        self.spn_ncomp.setRange(2, 2)
+        self.spn_ncomp.setToolTip(
+            "How many components to fit; defaults to the number of EEG channels. "
+            "Capped at the rank of the data (one fewer after an average reference).")
+        row.addWidget(self.spn_ncomp)
+        row.addWidget(self.btn_ica, 1)
+        lay.addLayout(row)
         row = QHBoxLayout()
         self.btn_ica_apply = QPushButton("Reconstruct from selected")
         self.btn_ica_apply.setToolTip("Rebuild the EEG from the components ticked in the "
@@ -876,7 +885,8 @@ class MainWindow(QMainWindow):
             return
         with self._busy("Fitting ICA (EEG channels only)…"):
             had_clean = self.raw_clean is not None
-            self.ica = proc.fit_ica(self.raw_pre)
+            requested = self.spn_ncomp.value()
+            self.ica = proc.fit_ica(self.raw_pre, requested)
             self._ica_spectra = [proc.component_spectrogram(s, self.ica.sfreq)
                                  for s in self.ica.sources]
             self._ica_labels = list(self.ica.labels)
@@ -888,8 +898,12 @@ class MainWindow(QMainWindow):
             for label in self._ica_labels:
                 counts[label] = counts.get(label, 0) + 1
             summary = ", ".join(f"{n} {label}" for label, n in counts.items())
-            self.lbl_ica.setText(f"{self.ica.n_components} components; review them "
-                                 "in the ICA tab.")
+            text = f"{self.ica.n_components} components; review them in the ICA tab."
+            if self.ica.n_components < requested:
+                text += (f"<br><span style='color:#f5a54e'>{requested} requested, but the "
+                         f"data has rank {self.ica.n_components} (e.g. after an average "
+                         "reference).</span>")
+            self.lbl_ica.setText(text)
             # Show the time course past the start-up drift of a recording.
             duration = self.ica.sources.shape[1] / self.ica.sfreq
             offset = self._offset(self.raw_pre)
@@ -1139,6 +1153,9 @@ class MainWindow(QMainWindow):
             self.raw_orig = raw
             self._invalidate("pre")
             n_eeg = len(mne.pick_types(raw.info, eeg=True))
+            # As many components as EEG channels, by default and at most.
+            self.spn_ncomp.setRange(2, max(2, n_eeg))
+            self.spn_ncomp.setValue(max(2, n_eeg))
             n_pos = len(proc.eeg_with_positions(raw.info))
             text = (f"{len(include)} channels selected ({n_eeg} EEG); "
                     f"{n_pos}/{n_eeg} EEG with positions.")

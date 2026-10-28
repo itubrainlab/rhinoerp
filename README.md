@@ -69,7 +69,8 @@ them to the release when a `v*` tag is pushed.
    line-noise notch, run as a zero-phase g.Pype batch pipeline.
 4. **Independent components (ICA, optional)** – *Fit ICA* decomposes the filtered EEG
    (extended Infomax on the EEG channels only, high-passed at 1 Hz for the fit; no EOG
-   channel is used). The *ICA* tab shows every component with its scalp map, time
+   channel is used). *Components* sets how many to fit: as many as EEG channels by
+   default, capped at the rank of the data (one fewer after an average reference). The *ICA* tab shows every component with its scalp map, time
    course and time–frequency power, and a suggested label (EEG, Eye blink, Muscle
    (EMG), Line noise, Channel noise, Other) from EEG-only features: frontal weighting,
    spikiness (kurtosis), rare large events (variance over robust variance), width of

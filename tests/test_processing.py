@@ -82,6 +82,12 @@ def test_statistics_find_the_simulated_n170(raw, prepared):
     assert again.p_perm == result.p_perm
 
 
+def test_ica_component_count(prepared):
+    rank = P.ica_rank(prepared)
+    assert P.fit_ica(prepared, 3).n_components == 3
+    assert P.fit_ica(prepared, 99).n_components == rank  # capped at the rank
+
+
 def test_ica_labels_and_removes_the_blinks(prepared):
     result = P.fit_ica(prepared)
     assert result.n_components == 8

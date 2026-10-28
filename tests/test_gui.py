@@ -71,7 +71,11 @@ def test_time_range(window, recording):
 def test_workflow_and_exported_script(window, tmp_path, monkeypatch):
     window.cmb_ref.setCurrentText("average")
     window.preprocess()
+    # As many components as EEG channels by default; the average reference
+    # leaves one fewer dimension, so the fit is capped at 7.
+    assert window.spn_ncomp.value() == window.spn_ncomp.maximum() == 8
     window.fit_ica()
+    assert window.ica.n_components == 7 and "rank 7" in window.lbl_ica.text()
     # Components labelled as artifacts start unticked, the rest ticked.
     labels = window._component_labels()
     blink = labels.index("Eye blink")

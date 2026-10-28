@@ -445,27 +445,40 @@ def _transient_ms(source: np.ndarray, sfreq: float) -> float:
     return 1000 * np.median(widths) / sfreq if widths else np.nan
 
 
-def fit_ica(raw: mne.io.BaseRaw, seed: int = 0) -> ICAResult:
+def ica_rank(raw: mne.io.BaseRaw) -> int:
+    """How many independent components the EEG channels of ``raw`` can hold.
+
+    The number of EEG channels, less one after an average reference and in
+    general the rank of the data, estimated from the data: a reference
+    applied to the data (not as a projector) removes a dimension the
+    metadata does not record. The relative tolerance ignores the float32
+    rounding of the g.Pype filter, which leaves ~1e-7 of noise in that
+    missing dimension.
+    """
+    eeg = raw.copy().pick("eeg")
+    return int(mne.compute_rank(eeg, rank=None, tol=1e-4, tol_kind="relative",
+                                verbose="error")["eeg"])
+
+
+def fit_ica(raw: mne.io.BaseRaw, n_components: int | None = None,
+            seed: int = 0) -> ICAResult:
     """Extended-Infomax ICA of the EEG channels.
 
-    The number of components is the rank of the EEG data (one fewer than
-    the channels after an average reference).
+    ``n_components`` defaults to the number of EEG channels and is capped
+    at the rank of the data (see ``ica_rank``): a component beyond it
+    would only model rounding noise, and makes the fit slow and unstable.
     """
     from scipy import stats
     from scipy.signal import welch
 
     eeg = raw.copy().pick("eeg")
-    # Estimated from the data: an average reference applied to the data
-    # (not as a projector) removes a dimension the metadata does not record.
-    # The relative tolerance ignores the float32 rounding of the g.Pype
-    # filter, which leaves ~1e-7 of noise in that missing dimension.
-    rank = mne.compute_rank(eeg, rank=None, tol=1e-4, tol_kind="relative",
-                            verbose="error")["eeg"]
-    if rank < 2:
-        raise ValueError("ICA needs at least 2 EEG channels.")
+    rank = ica_rank(eeg)
+    n_components = min(n_components or len(eeg.ch_names), rank)
+    if n_components < 2:
+        raise ValueError("ICA needs at least 2 components (and EEG channels).")
     training = eeg.copy().filter(ICA_HIGHPASS, None, verbose="error")
     ica = mne.preprocessing.ICA(
-        n_components=rank, method="infomax", fit_params=dict(extended=True),
+        n_components=n_components, method="infomax", fit_params=dict(extended=True),
         random_state=seed, max_iter="auto", verbose="error")
     ica.fit(training, verbose="error")
     sources = ica.get_sources(eeg).get_data()
