@@ -361,6 +361,8 @@ ICA_HIGHPASS = 1.0
 #: Labels a component can be given. The first is the default guess.
 COMPONENT_LABELS = ("EEG", "Eye blink", "Muscle (EMG)", "Line noise",
                     "Channel noise", "Other")
+#: Labels of components that are not kept by default.
+ARTIFACT_LABELS = ("Eye blink", "Muscle (EMG)", "Line noise", "Channel noise")
 
 
 @dataclass

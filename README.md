@@ -74,8 +74,9 @@ them to the release when a `v*` tag is pushed.
    (EMG), Line noise, Channel noise, Other) from EEG-only features: frontal weighting,
    spikiness (kurtosis), rare large events (variance over robust variance), width of
    the large deflections, share of power above 20 Hz, line-noise peak and focality.
-   Labels can be changed. All components start selected; untick the ones to remove and
-   click *Reconstruct from selected*. Later steps then use the reconstructed signal
+   Components labelled Eye blink, Muscle (EMG), Line noise or Channel noise start
+   unticked, the rest ticked; changing a label ticks or unticks the component to
+   match. Adjust the ticks and click *Reconstruct from selected*. Later steps then use the reconstructed signal
    (also shown as *ICA cleaned* in the *Signals* tab); *Undo* goes back.
 5. **Trigger and events** – choose the trigger channel (any channel, e.g. `TRIG` or
    BioSemi `Status`, or the file's annotations) and the bit mask, then *Find events*.

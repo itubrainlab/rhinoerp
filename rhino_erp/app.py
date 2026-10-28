@@ -716,7 +716,8 @@ class MainWindow(QMainWindow):
         w = QWidget()
         lay = QVBoxLayout(w)
         bar = QHBoxLayout()
-        bar.addWidget(QLabel("Untick components to remove, then click <b>Reconstruct "
+        bar.addWidget(QLabel("Components labelled as artifacts start unticked. Untick "
+                             "the components to remove, then click <b>Reconstruct "
                              "from selected</b> in step 4."))
         bar.addStretch(1)
         self.spn_ica_t0 = _spin(0, 100000, 0, 5, 0, "s")
@@ -775,7 +776,7 @@ class MainWindow(QMainWindow):
         self.tbl_ica.setRowCount(0)
         res = self.ica
         if res is not None:
-            removed = set(self._ica_excluded)
+            removed = set(self._ica_excluded) or self._artifact_components()
             for i in range(res.n_components):
                 self.tbl_ica.insertRow(i)
                 item = QTableWidgetItem(f"IC{i:02d}")
@@ -786,7 +787,8 @@ class MainWindow(QMainWindow):
                 label.setEditable(True)  # any label, not only the suggestions
                 label.addItems(proc.COMPONENT_LABELS)
                 label.setCurrentText(self._ica_labels[i])
-                label.currentTextChanged.connect(self._ica_label_changed)
+                label.currentTextChanged.connect(
+                    lambda text, row=i: self._ica_label_changed(row, text))
                 self.tbl_ica.setCellWidget(i, 1, label)
                 frontal, width = res.frontality[i], res.transient_ms[i]
                 for col, text in ((2, f"{100 * res.explained[i]:.1f}%"),
@@ -801,8 +803,15 @@ class MainWindow(QMainWindow):
             self.tbl_ica.resizeColumnsToContents()
         self._plot_ica()
 
-    def _ica_label_changed(self, _text):
+    def _artifact_components(self) -> set[int]:
+        return {i for i, label in enumerate(self._ica_labels)
+                if label in proc.ARTIFACT_LABELS}
+
+    def _ica_label_changed(self, row: int, text: str):
+        """A relabelled component is kept or removed according to its new label."""
         self._ica_labels = self._component_labels()
+        self.tbl_ica.item(row, 0).setCheckState(
+            Qt.Unchecked if text in proc.ARTIFACT_LABELS else Qt.Checked)
         self._plot_ica()
 
     def _plot_ica(self):
@@ -920,8 +929,10 @@ class MainWindow(QMainWindow):
         had_erps = bool(self.evokeds)
         self.raw_clean = None
         self._ica_excluded = []
+        artifacts = self._artifact_components()
         for i in range(self.tbl_ica.rowCount()):
-            self.tbl_ica.item(i, 0).setCheckState(Qt.Checked)
+            self.tbl_ica.item(i, 0).setCheckState(
+                Qt.Unchecked if i in artifacts else Qt.Checked)
         self._invalidate("erp")
         self.lbl_ica.setText("Using the filtered data with all components.")
         self.cmb_stage.setCurrentIndex(1)

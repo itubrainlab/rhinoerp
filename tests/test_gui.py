@@ -72,10 +72,20 @@ def test_workflow_and_exported_script(window, tmp_path, monkeypatch):
     window.cmb_ref.setCurrentText("average")
     window.preprocess()
     window.fit_ica()
-    # Every component starts selected; untick the one labelled as a blink.
-    assert len(window._selected_components()) == window.ica.n_components
-    blink = window._component_labels().index("Eye blink")
-    window.tbl_ica.item(blink, 0).setCheckState(Qt.Unchecked)
+    # Components labelled as artifacts start unticked, the rest ticked.
+    labels = window._component_labels()
+    blink = labels.index("Eye blink")
+    removed = [i for i, label in enumerate(labels) if label in A.proc.ARTIFACT_LABELS]
+    assert blink in removed
+    assert window._selected_components() == [i for i in range(len(labels))
+                                             if i not in removed]
+    # Relabelling ticks or unticks the component to match.
+    other = next(i for i in range(len(labels)) if i != blink)
+    window.tbl_ica.cellWidget(other, 1).setCurrentText("Eye blink")
+    assert other not in window._selected_components()
+    window.tbl_ica.cellWidget(other, 1).setCurrentText("EEG")
+    assert other in window._selected_components()
+    removed = [i for i in removed if i != other]
     window.apply_ica()
     assert window._current_raw() is window.raw_clean
     assert window.raw_clean.get_data(picks="Fz").std() < 0.5 * window.raw_pre.get_data(picks="Fz").std()
@@ -99,7 +109,7 @@ def test_workflow_and_exported_script(window, tmp_path, monkeypatch):
     assert (tmp_path / "analysis-ica.fif").exists()
     text = script.read_text()
     assert "raw.crop(*TIME_RANGE)" in text  # the first-to-last-event range
-    assert "REMOVED_COMPONENTS = [%d]" % blink in text and "Eye blink" in text
+    assert f"REMOVED_COMPONENTS = {removed}" in text and "Eye blink" in text
     monkeypatch.setattr(plt, "show", lambda *a, **k: None)
     ns = runpy.run_path(str(script))
     plt.close("all")
