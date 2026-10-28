@@ -98,14 +98,17 @@ def test_ica_labels_and_removes_the_blinks(prepared):
 
 
 def test_suggested_labels():
-    assert P.suggest_label(1.0, 0.3, 10, 0.05, 1, 0.1, 8, 300) == "Eye blink"
-    assert P.suggest_label(1.0, 0.3, 10, 0.05, 1, 0.002, 8, 300) == "EEG"  # too small
-    assert P.suggest_label(0.7, 0.3, 10, 0.05, 1, 0.1, 8, 300) == "EEG"  # peak not frontal
-    assert P.suggest_label(1.0, 0.3, 10, 0.05, 1, 0.1, 8, 40) == "EEG"  # too brief
-    assert P.suggest_label(0.2, 0.3, 1, 0.6, 1, 0.1, 8, np.nan) == "Muscle (EMG)"
-    assert P.suggest_label(0.2, 0.3, 1, 0.1, 20, 0.1, 8, np.nan) == "Line noise"
-    assert P.suggest_label(0.0, 0.8, 50, 0.0, 1, 0.1, 8, 300) == "Channel noise"
+    assert P.suggest_label(1.0, 0.3, 10, 0.05, 1, 0.1, 8, 300, 1.5) == "Eye blink"
+    assert P.suggest_label(1.0, 0.3, 10, 0.05, 1, 0.002, 8, 300, 1.5) == "EEG"  # too small
+    assert P.suggest_label(0.7, 0.3, 10, 0.05, 1, 0.1, 8, 300, 1.5) == "EEG"  # peak not frontal
+    assert P.suggest_label(1.0, 0.3, 10, 0.05, 1, 0.1, 8, 40, 1.5) == "EEG"  # too brief
+    assert P.suggest_label(0.2, 0.3, 1, 0.6, 1, 0.1, 8, np.nan, 1.5) == "Muscle (EMG)"
+    assert P.suggest_label(0.2, 0.3, 1, 0.1, 20, 0.1, 8, np.nan, 1.5) == "Line noise"
+    assert P.suggest_label(0.0, 0.8, 50, 0.0, 1, 0.1, 8, 300, 1.5) == "Channel noise"
     # Spiky but spread out: brief pops are channel noise, the rest "Other".
-    assert P.suggest_label(0.2, 0.3, 240, 0.0, 1, 0.8, 8, 90) == "Channel noise"
-    assert P.suggest_label(0.5, 0.3, 120, 0.0, 1, 0.01, 8, 480) == "Other"
-    assert P.suggest_label(0.3, 0.3, 1, 0.1, 1, 0.1, 8, np.nan) == "EEG"
+    assert P.suggest_label(0.2, 0.3, 240, 0.0, 1, 0.8, 8, 90, 1.5) == "Channel noise"
+    assert P.suggest_label(0.5, 0.3, 120, 0.0, 1, 0.01, 8, 480, 1.5) == "Other"
+    # Calm most of the time, but rare large events carry the variance.
+    assert P.suggest_label(0.2, 0.3, 1, 0.0, 1, 0.8, 8, 90, 600) == "Channel noise"
+    assert P.suggest_label(0.2, 0.3, 1, 0.0, 1, 0.8, 8, 2600, 600) == "Other"
+    assert P.suggest_label(0.3, 0.3, 1, 0.1, 1, 0.1, 8, np.nan, 1.5) == "EEG"

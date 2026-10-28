@@ -705,9 +705,10 @@ class MainWindow(QMainWindow):
             wid.valueChanged.connect(self._plot_ica)
         lay.addLayout(bar)
         body = QSplitter()
-        self.tbl_ica = QTableWidget(0, 7)
+        self.tbl_ica = QTableWidget(0, 8)
         self.tbl_ica.setHorizontalHeaderLabels(
-            ["Component", "Label", "Var.", "Frontal", "Spiky", "Width", ">20 Hz"])
+            ["Component", "Label", "Var.", "Frontal", "Spiky", "Outliers", "Width",
+             ">20 Hz"])
         self.tbl_ica.verticalHeader().setVisible(False)
         self.tbl_ica.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tbl_ica.setMinimumWidth(360)
@@ -717,11 +718,13 @@ class MainWindow(QMainWindow):
             2: "Share of the EEG variance the component accounts for.",
             3: "Weight at the most anterior electrodes relative to the largest, 0-1 "
                "(eye blinks peak at the front: close to 1).",
-            4: "Kurtosis of the time course: large, brief deflections (blinks, "
-               "electrode pops) score high.",
-            5: "Median duration of the large deflections (blinks: 150-500 ms; "
+            4: "Kurtosis of the time course (median over 10-s windows): recurring "
+               "large, brief deflections (blinks, electrode pops) score high.",
+            5: "Variance over robust variance: 1-3 for EEG, large when a few big "
+               "events (e.g. electrode pops) make up most of the variance.",
+            6: "Median duration of the large deflections (blinks: 150-500 ms; "
                "electrode pops: under 100 ms).",
-            6: "Share of 1-40 Hz power above 20 Hz (muscle activity is high).",
+            7: "Share of 1-40 Hz power above 20 Hz (muscle activity is high).",
         }
         for col, tip in tips.items():
             self.tbl_ica.horizontalHeaderItem(col).setToolTip(tip)
@@ -766,8 +769,9 @@ class MainWindow(QMainWindow):
                 for col, text in ((2, f"{100 * res.explained[i]:.1f}%"),
                                   (3, "–" if not np.isfinite(frontal) else f"{frontal:.2f}"),
                                   (4, f"{res.kurtosis[i]:.0f}"),
-                                  (5, "–" if not np.isfinite(width) else f"{width:.0f} ms"),
-                                  (6, f"{100 * res.high_freq[i]:.0f}%")):
+                                  (5, f"{res.outlier_ratio[i]:.0f}"),
+                                  (6, "–" if not np.isfinite(width) else f"{width:.0f} ms"),
+                                  (7, f"{100 * res.high_freq[i]:.0f}%")):
                     cell = QTableWidgetItem(text)
                     cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                     self.tbl_ica.setItem(i, col, cell)

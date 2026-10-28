@@ -69,8 +69,8 @@ them to the release when a `v*` tag is pushed.
    channel is used). The *ICA* tab shows every component with its scalp map, time
    course and time–frequency power, and a suggested label (EEG, Eye blink, Muscle
    (EMG), Line noise, Channel noise, Other) from EEG-only features: frontal weighting,
-   spikiness (kurtosis), width of the large deflections, share of power above 20 Hz,
-   line-noise peak and focality.
+   spikiness (kurtosis), rare large events (variance over robust variance), width of
+   the large deflections, share of power above 20 Hz, line-noise peak and focality.
    Labels can be changed. All components start selected; untick the ones to remove and
    click *Reconstruct from selected*. Later steps then use the reconstructed signal
    (also shown as *ICA cleaned* in the *Signals* tab); *Undo* goes back.

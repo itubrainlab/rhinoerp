@@ -347,10 +347,11 @@ class ICAResult:
     explained: np.ndarray  # fraction of EEG variance per component
     frontality: np.ndarray  # weight at the most anterior electrodes, 0-1
     focality: np.ndarray  # largest channel weight over the sum of weights
-    kurtosis: np.ndarray  # excess kurtosis of each time course
+    kurtosis: np.ndarray  # median excess kurtosis over 10-s windows
     high_freq: np.ndarray  # share of 1-40 Hz power above 20 Hz
     line_ratio: np.ndarray  # power at 50/60 Hz over its neighbourhood
     transient_ms: np.ndarray  # median duration of the large deflections (nan: none)
+    outlier_ratio: np.ndarray  # variance over robust (MAD-based) variance
     labels: list[str]  # suggested label per component
 
     @property
@@ -362,19 +363,27 @@ class ICAResult:
 BLINK_MS = (150.0, 500.0)
 #: Excess kurtosis above which a time course is too spiky to be brain activity.
 SPIKY_KURTOSIS = 20.0
+#: Kurtosis is measured in windows of this length (s) and the median taken,
+#: so a few large transients (e.g. at the start of a recording) do not make
+#: an otherwise clean component look spiky.
+KURTOSIS_WINDOW = 10.0
+#: Variance over robust variance above which rare, large events dominate a
+#: component (1-3 for EEG).
+OUTLIER_RATIO = 20.0
 
 
 def suggest_label(frontality, focality, kurtosis, high_freq, line_ratio,
-                  explained, n_channels, transient_ms) -> str:
+                  explained, n_channels, transient_ms, outlier_ratio) -> str:
     """A first guess at what a component is, from the EEG alone.
 
     Eye blinks peak at the most anterior electrode and are large, slow
     deflections of 150-500 ms carrying at least 1% of the variance; muscle
     activity is broadband and strong above 20 Hz; line noise is a narrow
-    peak at 50 or 60 Hz. A component that sits on a single electrode, or
-    whose large deflections are shorter than 100 ms (electrode pops), is
-    taken as channel noise; any other spiky time course is "Other". The
-    rest is taken to be brain activity. A guess to check, not a
+    peak at 50 or 60 Hz. A component that sits on a single electrode is
+    taken as channel noise. So is one that is spiky throughout, or whose
+    variance comes from rare, large events, when those events are shorter
+    than 100 ms (electrode pops); otherwise it is "Other". The rest is
+    taken to be brain activity. A guess to check, not a
     classification.
     """
     lo, hi = BLINK_MS
@@ -388,7 +397,7 @@ def suggest_label(frontality, focality, kurtosis, high_freq, line_ratio,
         return "Muscle (EMG)"
     if n_channels >= 4 and focality > 0.45:
         return "Channel noise"
-    if kurtosis > SPIKY_KURTOSIS:
+    if kurtosis > SPIKY_KURTOSIS or outlier_ratio > OUTLIER_RATIO:
         if np.isfinite(transient_ms) and transient_ms < 100:
             return "Channel noise"
         return "Other"
@@ -469,16 +478,26 @@ def fit_ica(raw: mne.io.BaseRaw, seed: int = 0) -> ICAResult:
             around = psd[:, (np.abs(freqs - f0) > 2) & (np.abs(freqs - f0) <= 6)].mean(axis=1)
             line_ratio = np.maximum(line_ratio, peak / around)
 
-    kurtosis = stats.kurtosis(sources, axis=1)
+    win = int(KURTOSIS_WINDOW * sfreq)
+    if sources.shape[1] >= 2 * win:
+        n_win = sources.shape[1] // win
+        windows = sources[:, :n_win * win].reshape(n, n_win, win)
+        kurtosis = np.median(stats.kurtosis(windows, axis=2), axis=1)
+    else:
+        kurtosis = stats.kurtosis(sources, axis=1)
     transient_ms = np.array([_transient_ms(s, sfreq) for s in sources])
+    robust_sd = 1.4826 * np.median(
+        np.abs(sources - np.median(sources, axis=1, keepdims=True)), axis=1)
+    outlier_ratio = sources.var(axis=1) / np.maximum(robust_sd, 1e-30) ** 2
     labels = [suggest_label(frontality[i], focality[i], kurtosis[i], high_freq[i],
                             line_ratio[i], explained[i], len(eeg.ch_names),
-                            transient_ms[i])
+                            transient_ms[i], outlier_ratio[i])
               for i in range(n)]
     return ICAResult(ica=ica, sources=sources, sfreq=sfreq, explained=explained,
                      frontality=frontality, focality=focality, kurtosis=kurtosis,
                      high_freq=high_freq, line_ratio=line_ratio,
-                     transient_ms=transient_ms, labels=labels)
+                     transient_ms=transient_ms, outlier_ratio=outlier_ratio,
+                     labels=labels)
 
 
 def remove_components(raw: mne.io.BaseRaw, ica: mne.preprocessing.ICA,
