@@ -209,6 +209,30 @@ def group_events(
     return events, event_id
 
 
+def event_time_range(raw: mne.io.BaseRaw, events: np.ndarray) -> tuple[float, float]:
+    """Times (s from the start of ``raw``) of its first and last events.
+
+    Rounded outwards to the millisecond so that cropping to the range
+    keeps both events. The whole recording if there are no events.
+    """
+    if not len(events):
+        return 0.0, float(raw.times[-1])
+    samples = events[:, 0] - raw.first_samp
+    sf = raw.info["sfreq"]
+    start = np.floor(1000 * samples.min() / sf) / 1000
+    end = np.ceil(1000 * samples.max() / sf) / 1000
+    return float(start), float(min(end, raw.times[-1]))
+
+
+def crop(raw: mne.io.BaseRaw, start: float, end: float) -> mne.io.BaseRaw:
+    """The part of ``raw`` from ``start`` to ``end`` (s from its start, both kept)."""
+    if start <= 0 and end >= raw.times[-1] - 1e-3:  # the whole recording (to the ms)
+        return raw
+    if end <= start:
+        raise ValueError(f"The range must end after it starts ({start:g}-{end:g} s).")
+    return raw.copy().crop(tmin=max(0.0, start), tmax=min(end, raw.times[-1]))
+
+
 def event_counts(events: np.ndarray) -> dict[int, int]:
     codes, counts = np.unique(events[:, 2], return_counts=True)
     return dict(zip(codes.tolist(), counts.tolist()))

@@ -97,7 +97,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Rhino ERP")
         self.resize(1400, 900)
 
-        self.raw_file: mne.io.BaseRaw | None = None  # as read from disk
+        self.raw_full: mne.io.BaseRaw | None = None  # as read from disk
+        self.raw_file: mne.io.BaseRaw | None = None  # the time range analysed
         self.path: str | None = None
         self.raw_orig: mne.io.BaseRaw | None = None  # selected channels, positions
         self.raw_pre: mne.io.BaseRaw | None = None  # filtered
@@ -134,9 +135,31 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(box)
         self.btn_open = QPushButton("Open BDF…")
         self.btn_open.clicked.connect(self.open_file)
+        lay.addWidget(self.btn_open)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Time range"))
+        self.spn_start = _spin(0, 0, 0, 1, 3, "s")
+        self.spn_end = _spin(0, 0, 0, 1, 3, "s")
+        tip = ("Only this part of the recording (s from its start) is processed and "
+               "analysed. Starts at the first and last events.")
+        for spin in (self.spn_start, self.spn_end):
+            spin.setToolTip(tip)
+        row.addWidget(self.spn_start, 1)
+        row.addWidget(QLabel("to"))
+        row.addWidget(self.spn_end, 1)
+        lay.addLayout(row)
+        row = QHBoxLayout()
+        self.btn_range_events = QPushButton("First to last event")
+        self.btn_range_events.clicked.connect(self._range_from_events)
+        self.btn_range_full = QPushButton("Whole recording")
+        self.btn_range_full.clicked.connect(self._range_full)
+        self.btn_range = QPushButton("Apply range")
+        self.btn_range.clicked.connect(self.apply_range)
+        for btn in (self.btn_range_events, self.btn_range_full, self.btn_range):
+            row.addWidget(btn)
+        lay.addLayout(row)
         self.lbl_file = QLabel("No file loaded")
         self.lbl_file.setWordWrap(True)
-        lay.addWidget(self.btn_open)
         lay.addWidget(self.lbl_file)
         layout.addWidget(box)
 
@@ -798,9 +821,10 @@ class MainWindow(QMainWindow):
         info = res.ica.info
         positioned = len(proc.eeg_with_positions(info)) == len(info.ch_names) >= 3
         patterns = res.ica.get_components()
-        a = int(self.spn_ica_t0.value() * sf)
+        offset = self._offset(self.raw_pre)  # times shown are recording times
+        a = max(0, int((self.spn_ica_t0.value() - offset) * sf))
         b = min(res.sources.shape[1], a + int(self.spn_ica_len.value() * sf))
-        times = np.arange(a, b) / sf
+        times = np.arange(a, b) / sf + offset
         for i in range(n):
             ax = fig.add_subplot(grid[i, 0])
             if positioned:
@@ -827,7 +851,7 @@ class MainWindow(QMainWindow):
             ax = fig.add_subplot(grid[i, 2])
             freqs, ttimes, power = self._ica_spectra[i]
             lo, hi = np.percentile(power, [5, 99])
-            ax.pcolormesh(ttimes, freqs, power, shading="auto", cmap="magma",
+            ax.pcolormesh(ttimes + offset, freqs, power, shading="auto", cmap="magma",
                           vmin=lo, vmax=hi, rasterized=True)
             ax.set_ylim(1, freqs[-1])
             ax.set_ylabel("Hz", fontsize=7)
@@ -859,9 +883,11 @@ class MainWindow(QMainWindow):
                                  "in the ICA tab.")
             # Show the time course past the start-up drift of a recording.
             duration = self.ica.sources.shape[1] / self.ica.sfreq
+            offset = self._offset(self.raw_pre)
             self.spn_ica_t0.blockSignals(True)
-            self.spn_ica_t0.setMaximum(max(0.0, duration - 5))
-            self.spn_ica_t0.setValue(min(30.0, max(0.0, duration - self.spn_ica_len.value())))
+            self.spn_ica_t0.setRange(offset, offset + max(0.0, duration - 5))
+            self.spn_ica_t0.setValue(
+                offset + min(30.0, max(0.0, duration - self.spn_ica_len.value())))
             self.spn_ica_t0.blockSignals(False)
             self.tabs.setCurrentIndex(TAB_ICA)
             self.statusBar().showMessage(f"ICA: {self.ica.n_components} components "
@@ -924,6 +950,9 @@ class MainWindow(QMainWindow):
 
     def _update_enabled(self):
         loaded = self.raw_file is not None
+        for widget in (self.spn_start, self.spn_end, self.btn_range_events,
+                       self.btn_range_full, self.btn_range):
+            widget.setEnabled(loaded)
         self.btn_chans.setEnabled(loaded)
         self.btn_events.setEnabled(loaded)
         self.btn_filter.setEnabled(self.raw_orig is not None)
@@ -1003,9 +1032,10 @@ class MainWindow(QMainWindow):
             self.load(path)
 
     def load(self, path: str):
+        loaded = False
         with self._busy(f"Loading {path}…"):
             raw = proc.load_bdf(path)
-            self.raw_file = raw
+            self.raw_full = self.raw_file = raw
             self.path = path
             self.raw_orig = None
             self._stats_requested = False
@@ -1016,20 +1046,69 @@ class MainWindow(QMainWindow):
                 f"<b>{path.split('/')[-1]}</b><br>{len(raw.ch_names)} channels, "
                 f"{sf:g} Hz, {raw.times[-1]:.1f} s"
             )
+            for spin in (self.spn_start, self.spn_end):
+                spin.setRange(0, raw.times[-1])
             self.spn_lp.setMaximum(sf / 2 - 1)
             self.cmb_trigger.clear()
             self.cmb_trigger.addItems([proc.ANNOTATIONS] + raw.ch_names)
             self.cmb_trigger.setCurrentText(proc.guess_trigger_channel(raw))
             self.tbl_events.setRowCount(0)
             self._reset_channel_table()
-            self.sld_time.setRange(0, max(0, int(raw.times[-1]) - 1))
-            self.sld_time.setValue(0)
             self.cmb_stage.setCurrentIndex(0)
-        if self.raw_file is not None:
+            loaded = True
+        if loaded:
+            self._range_from_events()
+            self.apply_range()
+            self.statusBar().showMessage(
+                "Loaded. Check the time range, channels and trigger, select events, "
+                "then filter.")
+
+    def _range_from_events(self):
+        """Set the time range to the first and last events on the trigger channel."""
+        if self.raw_full is None:
+            return
+        try:
+            events, _ = proc.find_events(self.raw_full, self.cmb_trigger.currentText(),
+                                         self.spn_mask.value())
+        except Exception:  # e.g. a trigger channel that cannot be read as codes
+            events = np.empty((0, 3), int)
+        start, end = proc.event_time_range(self.raw_full, events)
+        self.spn_start.setValue(start)
+        self.spn_end.setValue(end)
+
+    def _range_full(self):
+        if self.raw_full is not None:
+            self.spn_start.setValue(0)
+            self.spn_end.setValue(self.raw_full.times[-1])
+
+    def _offset(self, raw: mne.io.BaseRaw) -> float:
+        """Start of ``raw`` in the recording (s), to show recording times."""
+        return (raw.first_samp - self.raw_full.first_samp) / raw.info["sfreq"]
+
+    def apply_range(self):
+        """Crop the recording to the time range; everything after starts over."""
+        if self.raw_full is None:
+            return
+        done = False
+        with self._busy("Applying the time range…"):
+            start, end = self.spn_start.value(), self.spn_end.value()
+            if end <= start:
+                raise InputError("The time range must end after it starts.")
+            self.raw_file = proc.crop(self.raw_full, start, end)
+            self.raw_orig = None
+            self.events = None
+            self._invalidate("pre")
+            offset = self._offset(self.raw_file)
+            self.sld_time.setRange(int(offset),
+                                   max(int(offset), int(offset + self.raw_file.times[-1]) - 1))
+            self.sld_time.setValue(int(offset))
+            done = True
+        if done:
             self.apply_channels()
             self.find_events()
             self.statusBar().showMessage(
-                "Loaded. Check channels and trigger, select events, then filter.")
+                f"Analysing {self.spn_start.value():.3f}-{self.spn_end.value():.3f} s "
+                f"({self.raw_file.times[-1]:.1f} s).")
 
     def apply_channels(self):
         if self.raw_file is None:
@@ -1091,6 +1170,12 @@ class MainWindow(QMainWindow):
             self._invalidate("erp")
             counts = proc.event_counts(events) if len(events) else {}
             names = {v: k for k, v in event_id.items()}
+            # Keep the ticks and names of codes already listed (e.g. a new range).
+            kept = {}
+            for row in range(self.tbl_events.rowCount()):
+                item = self.tbl_events.item(row, 0)
+                kept[item.data(Qt.UserRole)] = (item.checkState(),
+                                                self.tbl_events.item(row, 2).text())
             self.tbl_events.setRowCount(0)
             for code, n in sorted(counts.items()):
                 row = self.tbl_events.rowCount()
@@ -1100,13 +1185,16 @@ class MainWindow(QMainWindow):
                 # One-off codes are usually start/end markers, not conditions.
                 item.setCheckState(Qt.Checked if n >= 2 else Qt.Unchecked)
                 item.setData(Qt.UserRole, int(code))
+                if code in kept:
+                    item.setCheckState(kept[code][0])
                 self.tbl_events.setItem(row, 0, item)
                 cnt = QTableWidgetItem(str(n))
                 cnt.setFlags(Qt.ItemIsEnabled)
                 self.tbl_events.setItem(row, 1, cnt)
                 label = names.get(code, str(code))
+                label = label if not label.isdigit() else f"event {label}"
                 self.tbl_events.setItem(row, 2, QTableWidgetItem(
-                    label if not label.isdigit() else f"event {label}"))
+                    kept[code][1] if code in kept else label))
             self.statusBar().showMessage(
                 f"{len(events)} events, {len(counts)} codes on "
                 f"{self.cmb_trigger.currentText()}.")
@@ -1285,6 +1373,8 @@ class MainWindow(QMainWindow):
             topomap_latency=round(self.latency, 3),
             # Topomaps need positions for every EEG channel the script plots.
             topomap_ok=len(positioned) >= 3 and len(positioned) == len(eeg),
+            time_range=(None if raw is self.raw_full else
+                        (self.spn_start.value(), self.spn_end.value())),
         )
 
     def export_script(self):
@@ -1340,16 +1430,18 @@ class MainWindow(QMainWindow):
         picks = mne.pick_types(raw.info, eeg=True, eog=True, emg=True, ecg=True,
                                misc=True)
         sf = raw.info["sfreq"]
+        offset = self._offset(raw)  # times shown are recording times
         t0 = float(self.sld_time.value())
         dur = self.spn_window.value()
-        a, b = int(t0 * sf), min(raw.n_times, int((t0 + dur) * sf))
+        a = max(0, int((t0 - offset) * sf))
+        b = min(raw.n_times, int((t0 + dur - offset) * sf))
         if b <= a or not len(picks):
             return
         data = raw.get_data(picks=picks, start=a, stop=b) * 1e6
         if raw is self.raw_orig:
             data = data - data.mean(axis=1, keepdims=True)  # hide DC offsets
         step = max(1, (b - a) // 4000)
-        times = raw.times[a:b:step]
+        times = raw.times[a:b:step] + offset
         data = data[:, ::step]
         scale = self.spn_scale.value()
         ticks = []
@@ -1364,7 +1456,7 @@ class MainWindow(QMainWindow):
             ev = events[(events[:, 0] - raw.first_samp >= a) &
                         (events[:, 0] - raw.first_samp < b)]
             for s, _, code in ev:
-                t = (s - raw.first_samp) / sf
+                t = (s - raw.first_samp) / sf + offset
                 plot.addItem(pg.InfiniteLine(t, pen=pg.mkPen("#5fd38d", style=Qt.DashLine)))
                 label = pg.TextItem(str(code), color="#5fd38d", anchor=(0, 1))
                 label.setPos(t, 1.4)

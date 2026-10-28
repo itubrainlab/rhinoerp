@@ -52,7 +52,10 @@ them to the release when a `v*` tag is pushed.
 
 ## Workflow
 
-1. **Recording** – open a `.bdf` (an `.edf` also works).
+1. **Recording** – open a `.bdf` (an `.edf` also works). *Time range* limits the
+   processing and analysis to part of the recording; it starts as the first to the
+   last event on the trigger channel and can be edited, reset to the events or set to
+   the whole recording, then *Apply range*. Every later step uses only that part.
 2. **Channels and electrodes** – the first 8 channels are preselected as EEG and
    assigned the Unicorn Hybrid Black electrodes (Fz, C3, Cz, C4, Pz, PO7, Oz, PO8);
    all other channels start deselected as `misc`. Tick channels to include them in

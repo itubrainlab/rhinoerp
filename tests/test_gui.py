@@ -41,6 +41,33 @@ def test_load_defaults(window):
     assert ticked == ["20", "30"]
 
 
+def test_time_range(window, recording):
+    # Prefilled with the first and last events (the first is at 2 s).
+    sf = window.raw_full.info["sfreq"]
+    assert window.spn_start.value() == pytest.approx(2.0)
+    assert window.raw_file.times[-1] < window.raw_full.times[-1]
+    assert sum(window.tbl_events.item(r, 1).text() != "" for r in
+               range(window.tbl_events.rowCount())) == 2
+    total = sum(int(window.tbl_events.item(r, 1).text())
+                for r in range(window.tbl_events.rowCount()))
+    assert total == len(recording[1])
+    # A shorter range keeps fewer events; the processing follows it.
+    window.tbl_events.item(0, 2).setText("standard")
+    window.spn_start.setValue(50)
+    window.spn_end.setValue(100)
+    window.apply_range()
+    assert window.raw_orig.times[-1] == pytest.approx(50, abs=1 / sf)
+    total = sum(int(window.tbl_events.item(r, 1).text())
+                for r in range(window.tbl_events.rowCount()))
+    assert 0 < total < len(recording[1])
+    assert window.tbl_events.item(0, 2).text() == "standard"  # names are kept
+    window.preprocess()
+    assert window.raw_pre.times[-1] == pytest.approx(50, abs=1 / sf)
+    window._range_full()
+    window.apply_range()
+    assert window.raw_file is window.raw_full
+
+
 def test_workflow_and_exported_script(window, tmp_path, monkeypatch):
     window.cmb_ref.setCurrentText("average")
     window.preprocess()
@@ -71,6 +98,7 @@ def test_workflow_and_exported_script(window, tmp_path, monkeypatch):
     window.export_script()
     assert (tmp_path / "analysis-ica.fif").exists()
     text = script.read_text()
+    assert "raw.crop(*TIME_RANGE)" in text  # the first-to-last-event range
     assert "REMOVED_COMPONENTS = [%d]" % blink in text and "Eye blink" in text
     monkeypatch.setattr(plt, "show", lambda *a, **k: None)
     ns = runpy.run_path(str(script))
@@ -78,5 +106,5 @@ def test_workflow_and_exported_script(window, tmp_path, monkeypatch):
     # MNE's filter differs from the app's g.Pype filter only slightly.
     assert ns["n_a"] == stats.a.n and ns["n_b"] == stats.b.n
     assert np.isclose(ns["difference"], stats.diff, atol=0.05)
-    assert np.isclose(ns["welch"].statistic, stats.t, atol=0.05)
+    assert np.isclose(ns["welch"].statistic, stats.t, rtol=0.01)
     assert ns["peak_a"][1] == pytest.approx(stats.a.peak_latency, abs=0.005)

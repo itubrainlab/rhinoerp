@@ -50,6 +50,7 @@ class AnalysisConfig:
     ica_file: str | None = None  # the ICA fitted in the app, saved by the export
     ica_exclude: list[int] = field(default_factory=list)  # components to remove
     ica_labels: dict[int, str] = field(default_factory=dict)  # their labels
+    time_range: tuple[float, float] | None = None  # s from the start; None = all
 
 
 def _py(value) -> str:
@@ -74,7 +75,8 @@ def build_script(cfg: AnalysisConfig) -> str:
 
     # ---------------------------------------------------------------- header
     steps = [
-        "1. Load the recording and find the trigger events.",
+        "1. Load the recording (the time range analysed) and find the trigger events."
+        if cfg.time_range else "1. Load the recording and find the trigger events.",
         "2. Keep the selected channels, name them after their electrodes and add",
         "   standard 10-05 electrode positions.",
         "3. Re-reference (optional) and filter.",
@@ -105,7 +107,12 @@ def build_script(cfg: AnalysisConfig) -> str:
 
     # ---------------------------------------------------------------- settings
     add("# --- Settings (edit these) " + "-" * 50)
-    add(f"RECORDING = {cfg.recording!r}\n")
+    add(f"RECORDING = {cfg.recording!r}")
+    if cfg.time_range:
+        add("# Part of the recording to analyse: start and end, s from its start")
+        add(f"TIME_RANGE = ({_py(float(cfg.time_range[0]))}, "
+            f"{_py(float(cfg.time_range[1]))})")
+    add("")
     add("# Channels to keep: name in the recording -> electrode name (10-05 system)")
     add(f"CHANNELS = {_dict(cfg.channels)}")
     if cfg.channel_types:
@@ -160,6 +167,8 @@ def build_script(cfg: AnalysisConfig) -> str:
     add(_section("1. Load the recording and find the events"))
     reader = "read_raw_bdf" if cfg.recording.lower().endswith(".bdf") else "read_raw_edf"
     add(f"raw = mne.io.{reader}(RECORDING, preload=True)")
+    if cfg.time_range:
+        add("raw.crop(*TIME_RANGE)")
     if cfg.trigger_channel:
         if not cfg.trigger_is_stim:
             add("# The reader types every channel as EEG; mark the trigger channel as a")
@@ -175,8 +184,10 @@ def build_script(cfg: AnalysisConfig) -> str:
             add("raw.apply_function(lambda x: np.round(x), picks=TRIGGER_CHANNEL)")
         mask = (f", mask={hex(cfg.trigger_mask)}, mask_type=\"and\""
                 if cfg.trigger_mask else "")
+        # A range may start on an event: count it, as the app does.
+        initial = ", initial_event=True" if cfg.time_range else ""
         add("events = mne.find_events(raw, stim_channel=TRIGGER_CHANNEL, "
-            f"shortest_event=1, consecutive=True{mask})")
+            f"shortest_event=1, consecutive=True{initial}{mask})")
         add("# Tag each code with its condition: epochs['name'] then selects all of them.")
         add("event_id = {f\"{name}/{code}\": code")
         add("            for name, codes in CONDITIONS.items() for code in codes}")
