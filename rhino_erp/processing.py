@@ -350,6 +350,7 @@ class ICAResult:
     kurtosis: np.ndarray  # excess kurtosis of each time course
     high_freq: np.ndarray  # share of 1-40 Hz power above 20 Hz
     line_ratio: np.ndarray  # power at 50/60 Hz over its neighbourhood
+    transient_ms: np.ndarray  # median duration of the large deflections (nan: none)
     labels: list[str]  # suggested label per component
 
     @property
@@ -357,19 +358,29 @@ class ICAResult:
         return len(self.explained)
 
 
+#: Deflections of a blink component last this long (ms).
+BLINK_MS = (150.0, 500.0)
+#: Excess kurtosis above which a time course is too spiky to be brain activity.
+SPIKY_KURTOSIS = 20.0
+
+
 def suggest_label(frontality, focality, kurtosis, high_freq, line_ratio,
-                  explained, n_channels) -> str:
+                  explained, n_channels, transient_ms) -> str:
     """A first guess at what a component is, from the EEG alone.
 
-    Eye blinks project to the front of the head and are large, brief,
-    slow deflections; muscle activity is broadband and strong above
-    20 Hz; line noise is a narrow peak at 50 or 60 Hz; a component that
-    sits on a single electrode is usually that electrode's noise. The rest
-    is taken to be brain activity. A blink component must also carry at
-    least 1% of the variance. A guess to check, not a classification.
+    Eye blinks peak at the most anterior electrode and are large, slow
+    deflections of 150-500 ms carrying at least 1% of the variance; muscle
+    activity is broadband and strong above 20 Hz; line noise is a narrow
+    peak at 50 or 60 Hz. A component that sits on a single electrode, or
+    whose large deflections are shorter than 100 ms (electrode pops), is
+    taken as channel noise; any other spiky time course is "Other". The
+    rest is taken to be brain activity. A guess to check, not a
+    classification.
     """
-    if (np.isfinite(frontality) and frontality >= 0.7 and kurtosis > 5
-            and high_freq < 0.3 and explained >= 0.01):
+    lo, hi = BLINK_MS
+    if (np.isfinite(frontality) and frontality >= 0.9 and kurtosis > 5
+            and high_freq < 0.3 and explained >= 0.01
+            and np.isfinite(transient_ms) and lo <= transient_ms <= hi):
         return "Eye blink"
     if line_ratio > 5:
         return "Line noise"
@@ -377,7 +388,26 @@ def suggest_label(frontality, focality, kurtosis, high_freq, line_ratio,
         return "Muscle (EMG)"
     if n_channels >= 4 and focality > 0.45:
         return "Channel noise"
+    if kurtosis > SPIKY_KURTOSIS:
+        if np.isfinite(transient_ms) and transient_ms < 100:
+            return "Channel noise"
+        return "Other"
     return "EEG"
+
+
+def _transient_ms(source: np.ndarray, sfreq: float) -> float:
+    """Median duration of a time course's large deflections, in ms.
+
+    A deflection is a run beyond 4 robust SDs that reaches 8 somewhere;
+    nan if there is none.
+    """
+    mad = 1.4826 * np.median(np.abs(source - np.median(source)))
+    if mad == 0:
+        return np.nan
+    z = np.abs(source - np.median(source)) / mad
+    edges = np.flatnonzero(np.diff(np.r_[0, (z > 4).astype(int), 0]))
+    widths = [b - a for a, b in zip(edges[::2], edges[1::2]) if z[a:b].max() > 8]
+    return 1000 * np.median(widths) / sfreq if widths else np.nan
 
 
 def fit_ica(raw: mne.io.BaseRaw, seed: int = 0) -> ICAResult:
@@ -416,7 +446,8 @@ def fit_ica(raw: mne.io.BaseRaw, seed: int = 0) -> ICAResult:
         .get_data().var(axis=1).sum() for i in range(n)]) / total
 
     # Scalp map: weight at the most anterior electrodes (top quarter of the
-    # front-back range) relative to the largest weight, 0-1, and how much
+    # front-back range) relative to the largest weight, 0-1 (1: the map
+    # peaks at the front), and how much
     # of the map sits on a single electrode.
     weights = np.abs(patterns)
     focality = weights.max(axis=0) / weights.sum(axis=0)
@@ -439,12 +470,15 @@ def fit_ica(raw: mne.io.BaseRaw, seed: int = 0) -> ICAResult:
             line_ratio = np.maximum(line_ratio, peak / around)
 
     kurtosis = stats.kurtosis(sources, axis=1)
+    transient_ms = np.array([_transient_ms(s, sfreq) for s in sources])
     labels = [suggest_label(frontality[i], focality[i], kurtosis[i], high_freq[i],
-                            line_ratio[i], explained[i], len(eeg.ch_names))
+                            line_ratio[i], explained[i], len(eeg.ch_names),
+                            transient_ms[i])
               for i in range(n)]
     return ICAResult(ica=ica, sources=sources, sfreq=sfreq, explained=explained,
                      frontality=frontality, focality=focality, kurtosis=kurtosis,
-                     high_freq=high_freq, line_ratio=line_ratio, labels=labels)
+                     high_freq=high_freq, line_ratio=line_ratio,
+                     transient_ms=transient_ms, labels=labels)
 
 
 def remove_components(raw: mne.io.BaseRaw, ica: mne.preprocessing.ICA,
