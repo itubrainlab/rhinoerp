@@ -1,11 +1,14 @@
 """Rhino ERP: a desktop app for offline ERP analysis of BDF recordings.
 
-Workflow (left panel, top to bottom):
-  1. Open a .bdf file (MNE).
+Workflow (left panel, top to bottom), all processing done with MNE:
+  1. Open a .bdf file.
   2. Select channels, set their types and assign electrode labels.
-  3. Pick the trigger channel, then tick and name the events to analyse.
-  4. Filter (g.Pype pipeline).
-  5. Epoch, average and inspect the ERPs.
+  3. Filter.
+  4. Pick the trigger channel, then tick and name the events to analyse.
+  5. Optionally remove independent components (ICA, fitted from the first to
+     the last trigger).
+  6. Re-reference (optional, after ICA).
+  7. Epoch, average and inspect the ERPs; compare conditions statistically.
 """
 
 from __future__ import annotations
@@ -97,15 +100,14 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Rhino ERP")
         self.resize(1400, 900)
 
-        self.raw_full: mne.io.BaseRaw | None = None  # as read from disk
-        self.raw_file: mne.io.BaseRaw | None = None  # the time range analysed
+        self.raw_file: mne.io.BaseRaw | None = None  # as read from disk
         self.path: str | None = None
         self.raw_orig: mne.io.BaseRaw | None = None  # selected channels, positions
         self.raw_pre: mne.io.BaseRaw | None = None  # filtered
         self.ica: proc.ICAResult | None = None
         self.raw_clean: mne.io.BaseRaw | None = None  # reconstructed from selected ICs
+        self.raw_ref: mne.io.BaseRaw | None = None  # re-referenced: epochs come from it
         self._ica_excluded: list[int] = []
-        self._ica_spectra: list = []
         self._ica_labels: list[str] = []
         self.events: np.ndarray | None = None
         self.epochs: mne.Epochs | None = None
@@ -136,28 +138,6 @@ class MainWindow(QMainWindow):
         self.btn_open = QPushButton("Open BDF…")
         self.btn_open.clicked.connect(self.open_file)
         lay.addWidget(self.btn_open)
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Time range"))
-        self.spn_start = _spin(0, 0, 0, 1, 3, "s")
-        self.spn_end = _spin(0, 0, 0, 1, 3, "s")
-        tip = ("Only this part of the recording (s from its start) is processed and "
-               "analysed. Starts at the first and last events.")
-        for spin in (self.spn_start, self.spn_end):
-            spin.setToolTip(tip)
-        row.addWidget(self.spn_start, 1)
-        row.addWidget(QLabel("to"))
-        row.addWidget(self.spn_end, 1)
-        lay.addLayout(row)
-        row = QHBoxLayout()
-        self.btn_range_events = QPushButton("First to last event")
-        self.btn_range_events.clicked.connect(self._range_from_events)
-        self.btn_range_full = QPushButton("Whole recording")
-        self.btn_range_full.clicked.connect(self._range_full)
-        self.btn_range = QPushButton("Apply range")
-        self.btn_range.clicked.connect(self.apply_range)
-        for btn in (self.btn_range_events, self.btn_range_full, self.btn_range):
-            row.addWidget(btn)
-        lay.addLayout(row)
         self.lbl_file = QLabel("No file loaded")
         self.lbl_file.setWordWrap(True)
         lay.addWidget(self.lbl_file)
@@ -193,21 +173,10 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.lbl_chans)
         layout.addWidget(box)
 
-        # 3. Reference and filtering
-        box = QGroupBox("3. Reference (optional) and filtering (g.Pype)")
+        # 3. Filtering
+        box = QGroupBox("3. Filtering")
         lay = QVBoxLayout(box)
         form = QFormLayout()
-        self.cmb_ref = QComboBox()
-        self.cmb_ref.setToolTip("Keep the recording reference, use the average of all "
-                                "selected EEG channels, or one EEG channel.")
-        self.cmb_ref2 = QComboBox()
-        self.cmb_ref2.setToolTip("Optional second reference channel; the mean of both "
-                                 "is used (e.g. linked mastoids).")
-        self.cmb_ref.currentTextChanged.connect(
-            lambda text: self.cmb_ref2.setEnabled(
-                text not in ("", proc.REF_NONE, proc.REF_AVERAGE)))
-        form.addRow("Reference", self.cmb_ref)
-        form.addRow("… averaged with", self.cmb_ref2)
         self.spn_hp = _spin(0, 10, 0.1, 0.05, 2, "Hz", "off")
         self.spn_lp = _spin(0, 200, 30, 1, 1, "Hz", "off")
         self.cmb_notch = QComboBox()
@@ -221,47 +190,13 @@ class MainWindow(QMainWindow):
         form.addRow("Line noise", self.cmb_notch)
         form.addRow("Order", self.spn_order)
         lay.addLayout(form)
-        self.btn_filter = QPushButton("Apply reference + filter")
+        self.btn_filter = QPushButton("Apply filter")
         self.btn_filter.clicked.connect(self.preprocess)
         lay.addWidget(self.btn_filter)
         layout.addWidget(box)
 
-        # 4. ICA
-        box = QGroupBox("4. Independent components (ICA, optional)")
-        lay = QVBoxLayout(box)
-        self.btn_ica = QPushButton("Fit ICA")
-        self.btn_ica.setToolTip("Decompose the filtered EEG into independent components "
-                                "(extended Infomax, EEG channels only) and inspect them "
-                                "in the ICA tab.")
-        self.btn_ica.clicked.connect(self.fit_ica)
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Components"))
-        self.spn_ncomp = QSpinBox()
-        self.spn_ncomp.setRange(2, 2)
-        self.spn_ncomp.setToolTip(
-            "How many components to fit; defaults to the number of EEG channels. "
-            "Capped at the rank of the data (one fewer after an average reference).")
-        row.addWidget(self.spn_ncomp)
-        row.addWidget(self.btn_ica, 1)
-        lay.addLayout(row)
-        row = QHBoxLayout()
-        self.btn_ica_apply = QPushButton("Reconstruct from selected")
-        self.btn_ica_apply.setToolTip("Rebuild the EEG from the components ticked in the "
-                                      "ICA tab only; unticked components are removed.")
-        self.btn_ica_apply.clicked.connect(self.apply_ica)
-        self.btn_ica_reset = QPushButton("Undo")
-        self.btn_ica_reset.setToolTip("Use the filtered data with all components again.")
-        self.btn_ica_reset.clicked.connect(self.reset_ica)
-        row.addWidget(self.btn_ica_apply, 1)
-        row.addWidget(self.btn_ica_reset)
-        lay.addLayout(row)
-        self.lbl_ica = QLabel("Optional: fit after step 3.")
-        self.lbl_ica.setWordWrap(True)
-        lay.addWidget(self.lbl_ica)
-        layout.addWidget(box)
-
-        # 5. Trigger and events
-        box = QGroupBox("5. Trigger and events")
+        # 4. Trigger and events
+        box = QGroupBox("4. Trigger and events")
         lay = QVBoxLayout(box)
         form = QFormLayout()
         self.cmb_trigger = QComboBox()
@@ -314,8 +249,66 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.tbl_events)
         layout.addWidget(box)
 
-        # 6. ERPs
-        box = QGroupBox("6. Epochs and ERPs")
+        # 5. ICA
+        box = QGroupBox("5. Independent components (ICA, optional)")
+        lay = QVBoxLayout(box)
+        self.btn_ica = QPushButton("Fit ICA")
+        self.btn_ica.setToolTip("Decompose the filtered EEG into independent components "
+                                "(extended Infomax, EEG channels only), fitted on the "
+                                "data from the first to the last trigger, and inspect "
+                                "them in the ICA tab.")
+        self.btn_ica.clicked.connect(self.fit_ica)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Components"))
+        self.spn_ncomp = QSpinBox()
+        self.spn_ncomp.setRange(2, 2)
+        self.spn_ncomp.setToolTip(
+            "How many components to fit: at most, and by default, the rank of the "
+            "filtered EEG (normally the number of EEG channels).")
+        row.addWidget(self.spn_ncomp)
+        row.addWidget(self.btn_ica, 1)
+        lay.addLayout(row)
+        row = QHBoxLayout()
+        self.btn_ica_apply = QPushButton("Reconstruct from selected")
+        self.btn_ica_apply.setToolTip("Rebuild the EEG from the components ticked in the "
+                                      "ICA tab only; unticked components are removed.")
+        self.btn_ica_apply.clicked.connect(self.apply_ica)
+        self.btn_ica_reset = QPushButton("Undo")
+        self.btn_ica_reset.setToolTip("Use the filtered data with all components again.")
+        self.btn_ica_reset.clicked.connect(self.reset_ica)
+        row.addWidget(self.btn_ica_apply, 1)
+        row.addWidget(self.btn_ica_reset)
+        lay.addLayout(row)
+        self.lbl_ica = QLabel("Optional: fit after steps 3 and 4.")
+        self.lbl_ica.setWordWrap(True)
+        lay.addWidget(self.lbl_ica)
+        layout.addWidget(box)
+
+        # 6. Reference
+        box = QGroupBox("6. Reference (optional)")
+        lay = QVBoxLayout(box)
+        form = QFormLayout()
+        self.cmb_ref = QComboBox()
+        self.cmb_ref.setToolTip("Keep the recording reference, use the average of all "
+                                "selected EEG channels, or one EEG channel.")
+        self.cmb_ref2 = QComboBox()
+        self.cmb_ref2.setToolTip("Optional second reference channel; the mean of both "
+                                 "is used (e.g. linked mastoids).")
+        self.cmb_ref.currentTextChanged.connect(
+            lambda text: self.cmb_ref2.setEnabled(
+                text not in ("", proc.REF_NONE, proc.REF_AVERAGE)))
+        form.addRow("Reference", self.cmb_ref)
+        form.addRow("… averaged with", self.cmb_ref2)
+        lay.addLayout(form)
+        note = QLabel("Applied after ICA, to the data the epochs are cut from.")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        self.cmb_ref.currentTextChanged.connect(self._reference_changed)
+        self.cmb_ref2.currentTextChanged.connect(self._reference_changed)
+        layout.addWidget(box)
+
+        # 7. ERPs
+        box = QGroupBox("7. Epochs and ERPs")
         lay = QVBoxLayout(box)
         form = QFormLayout()
         self.spn_tmin = _spin(-2, 0, -0.2, 0.05, 3, "s")
@@ -359,7 +352,7 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(w)
         bar = QHBoxLayout()
         self.cmb_stage = QComboBox()
-        self.cmb_stage.addItems(["Raw", "Filtered", "ICA cleaned"])
+        self.cmb_stage.addItems(["Raw", "Filtered", "ICA cleaned", "Referenced"])
         self.cmb_stage.currentIndexChanged.connect(self._plot_signals)
         self.spn_window = _spin(1, 60, 10, 1, 0, "s")
         self.spn_window.valueChanged.connect(self._plot_signals)
@@ -448,12 +441,6 @@ class MainWindow(QMainWindow):
         self.cmb_polarity.addItems(["negative", "positive"])
         self.cmb_cond_a = QComboBox()
         self.cmb_cond_b = QComboBox()
-        self.spn_perm = QSpinBox()
-        self.spn_perm.setRange(500, 20000)
-        self.spn_perm.setSingleStep(500)
-        self.spn_perm.setValue(5000)
-        self.spn_perm.setToolTip("Label shuffles for the permutation test of the window "
-                                 "mean amplitude.")
         self.btn_stats = QPushButton("Run statistics")
         self.btn_stats.clicked.connect(lambda: self.run_stats())
         self.btn_export = QPushButton("Export CSV…")
@@ -473,9 +460,7 @@ class MainWindow(QMainWindow):
         cfg.addWidget(self.cmb_polarity, 0, 5)
         cfg.addWidget(QLabel("Compare"), 1, 0)
         cfg.addLayout(pair(self.cmb_cond_a, "vs", self.cmb_cond_b), 1, 1)
-        cfg.addWidget(QLabel("Permutations"), 1, 2)
-        cfg.addWidget(self.spn_perm, 1, 3)
-        cfg.addLayout(pair(self.btn_stats, self.btn_export), 1, 4, 1, 2)
+        cfg.addLayout(pair(self.btn_stats, self.btn_export), 1, 2, 1, 4)
         cfg.setColumnStretch(1, 1)
         lay.addLayout(cfg)
 
@@ -590,7 +575,7 @@ class MainWindow(QMainWindow):
     def run_stats(self, quiet: bool = False):
         if not self.evokeds:
             if not quiet:
-                QMessageBox.information(self, "No ERPs", "Compute ERPs in step 6 first.")
+                QMessageBox.information(self, "No ERPs", "Compute ERPs in step 7 first.")
             return
         with self._busy("Running ERP statistics…"):
             a, b = self.cmb_cond_a.currentText(), self.cmb_cond_b.currentText()
@@ -599,14 +584,13 @@ class MainWindow(QMainWindow):
             comp = self._component()
             if comp.tmin >= comp.tmax:
                 raise InputError("The window must start before it ends.")
-            self.stats = proc.compare_conditions(self.epochs, a, b, comp,
-                                                 n_perm=self.spn_perm.value())
+            self.stats = proc.compare_conditions(self.epochs, a, b, comp)
             self._stats_requested = True
             if not quiet:
                 self.tabs.setCurrentIndex(TAB_STATS)
             self.statusBar().showMessage(
                 f"{comp.name}: {a} − {b} = {self.stats.diff:+.2f} µV, "
-                f"p = {self.stats.p_welch:.3g} (Welch), {self.stats.p_perm:.3g} (perm.)")
+                f"Welch t({self.stats.df:.1f}) = {self.stats.t:.2f}, p = {self.stats.p:.3g}")
         self._show_stats()
 
     def _show_stats(self):
@@ -630,9 +614,8 @@ class MainWindow(QMainWindow):
             plot.addItem(pg.FillBetweenItem(hi, lo, brush=band))
             plot.plot(res.times, erp, pen=pg.mkPen(color, width=2),
                       name=f"{s.name} (n={s.n})")
-            if not s.peak_at_edge:
-                plot.plot([s.peak_latency], [s.peak_amp], pen=None, symbol="o",
-                          symbolSize=8, symbolBrush=color, symbolPen=pg.mkPen("#1a1a19"))
+            plot.plot([s.peak_latency], [s.peak_amp], pen=None, symbol="o",
+                      symbolSize=8, symbolBrush=color, symbolPen=pg.mkPen("#1a1a19"))
         region = pg.LinearRegionItem((comp.tmin, comp.tmax), movable=False,
                                      brush=QColor(255, 255, 255, 25))
         region.setZValue(-10)
@@ -642,24 +625,16 @@ class MainWindow(QMainWindow):
         plot.setTitle(f"{comp.name} at {'+'.join(comp.channels)}, "
                       f"{comp.tmin*1000:.0f}–{comp.tmax*1000:.0f} ms (shaded)")
 
-        def fmt_lat(s):
-            return f"{s.peak_latency*1000:.0f} ms" + (" (edge — no clear peak)"
-                                                       if s.peak_at_edge else "")
-
-        lat_test = ("not testable (no clear peak in both)" if np.isnan(res.latency_p)
-                    else f"{res.latency_diff*1000:+.0f} ms, jackknife p = {res.latency_p:.3g}")
         rows = [
             ("Condition", res.a.name, res.b.name, ""),
             ("Trials", str(res.a.n), str(res.b.n), ""),
             ("Mean amplitude (window)", f"{res.a.mean_amp:+.2f} ± {res.a.sem:.2f} µV",
              f"{res.b.mean_amp:+.2f} ± {res.b.sem:.2f} µV",
-             f"{res.diff:+.2f} µV; t({res.df:.1f}) = {res.t:.2f}, p = {res.p_welch:.3g}"),
-            ("Permutation test (mean amp.)", "", "",
-             f"p = {res.p_perm:.3g} ({res.n_perm} permutations)"),
-            ("Effect size", "", "", f"Hedges' g = {res.hedges_g:+.2f}"),
+             f"{res.diff:+.2f} µV; Welch t({res.df:.1f}) = {res.t:.2f}, p = {res.p:.3g}"),
             ("Peak amplitude (average ERP)", f"{res.a.peak_amp:+.2f} µV",
              f"{res.b.peak_amp:+.2f} µV", ""),
-            ("Peak latency (average ERP)", fmt_lat(res.a), fmt_lat(res.b), lat_test),
+            ("Peak latency (average ERP)", f"{res.a.peak_latency*1000:.0f} ms",
+             f"{res.b.peak_latency*1000:.0f} ms", f"{res.latency_diff*1000:+.0f} ms"),
         ]
         for row in rows:
             r = self.tbl_stats.rowCount()
@@ -706,15 +681,11 @@ class MainWindow(QMainWindow):
                     ("n_a", res.a.n), ("n_b", res.b.n),
                     ("mean_amp_a_uV", res.a.mean_amp), ("mean_amp_b_uV", res.b.mean_amp),
                     ("diff_uV", res.diff), ("welch_t", res.t), ("welch_df", res.df),
-                    ("welch_p", res.p_welch), ("perm_p", res.p_perm),
-                    ("n_permutations", res.n_perm), ("hedges_g", res.hedges_g),
+                    ("welch_p", res.p),
                     ("peak_amp_a_uV", res.a.peak_amp), ("peak_amp_b_uV", res.b.peak_amp),
                     ("peak_lat_a_ms", res.a.peak_latency * 1000),
                     ("peak_lat_b_ms", res.b.peak_latency * 1000),
-                    ("peak_a_at_edge", res.a.peak_at_edge),
-                    ("peak_b_at_edge", res.b.peak_at_edge),
                     ("latency_diff_ms", res.latency_diff * 1000),
-                    ("latency_jackknife_p", res.latency_p),
                 ]:
                     writer.writerow([key, value])
             self.statusBar().showMessage(f"Saved {path} and {summary_path}")
@@ -727,45 +698,36 @@ class MainWindow(QMainWindow):
         bar = QHBoxLayout()
         bar.addWidget(QLabel("Components labelled as artifacts start unticked. Untick "
                              "the components to remove, then click <b>Reconstruct "
-                             "from selected</b> in step 4."))
+                             "from selected</b> in step 5."))
         bar.addStretch(1)
-        self.spn_ica_t0 = _spin(0, 100000, 0, 5, 0, "s")
-        self.spn_ica_len = _spin(5, 120, 20, 5, 0, "s")
-        for label, wid in (("Time course from", self.spn_ica_t0),
-                           ("length", self.spn_ica_len)):
-            bar.addWidget(QLabel(label))
-            bar.addWidget(wid)
-            wid.valueChanged.connect(self._plot_ica)
         lay.addLayout(bar)
         body = QSplitter()
-        self.tbl_ica = QTableWidget(0, 8)
+        self.tbl_ica = QTableWidget(0, 5)
         self.tbl_ica.setHorizontalHeaderLabels(
-            ["Component", "Label", "Var.", "Frontal", "Spiky", "Outliers", "Width",
-             ">20 Hz"])
+            ["Component", "Label", "Var.", "Blink r", "Muscle"])
         self.tbl_ica.verticalHeader().setVisible(False)
         self.tbl_ica.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tbl_ica.setMinimumWidth(360)
         tips = {
             0: "Ticked components are kept; unticked ones are removed.",
             1: "Suggested from the EEG alone; change it if the maps say otherwise.",
-            2: "Share of the EEG variance the component accounts for.",
-            3: "Weight at the most anterior electrodes relative to the largest, 0-1 "
-               "(eye blinks peak at the front: close to 1).",
-            4: "Kurtosis of the time course (median over 10-s windows): recurring "
-               "large, brief deflections (blinks, electrode pops) score high.",
-            5: "Variance over robust variance: 1-3 for EEG, large when a few big "
-               "events (e.g. electrode pops) make up most of the variance.",
-            6: "Median duration of the large deflections (blinks: 150-500 ms; "
-               "electrode pops: under 100 ms).",
-            7: "Share of 1-40 Hz power above 20 Hz (muscle activity is high).",
+            2: "Share of the EEG variance the component explains (MNE).",
+            3: "Correlation with the most anterior EEG electrode, 1-10 Hz (MNE "
+               f"find_bads_eog); |r| ≥ {proc.BLINK_CORRELATION:g} suggests a blink.",
+            4: f"MNE's muscle score (find_bads_muscle); ≥ {proc.MUSCLE_SCORE:g} "
+               "suggests muscle activity.",
         }
         for col, tip in tips.items():
             self.tbl_ica.horizontalHeaderItem(col).setToolTip(tip)
         body.addWidget(self.tbl_ica)
+        # The panels of MNE's plot_properties, one row per component.
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        self.cnv_ica = MplCanvas(4)
-        scroll.setWidget(self.cnv_ica)
+        holder = QWidget()
+        self.lay_ica = QVBoxLayout(holder)
+        self.lay_ica.addStretch(1)
+        self._ica_rows: list[QGroupBox] = []
+        scroll.setWidget(holder)
         body.addWidget(scroll)
         body.setStretchFactor(1, 1)
         body.setSizes([380, 640])
@@ -788,7 +750,7 @@ class MainWindow(QMainWindow):
             removed = set(self._ica_excluded) or self._artifact_components()
             for i in range(res.n_components):
                 self.tbl_ica.insertRow(i)
-                item = QTableWidgetItem(f"IC{i:02d}")
+                item = QTableWidgetItem(f"ICA{i:03d}")  # MNE's names
                 item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
                 item.setCheckState(Qt.Unchecked if i in removed else Qt.Checked)
                 self.tbl_ica.setItem(i, 0, item)
@@ -799,17 +761,15 @@ class MainWindow(QMainWindow):
                 label.currentTextChanged.connect(
                     lambda text, row=i: self._ica_label_changed(row, text))
                 self.tbl_ica.setCellWidget(i, 1, label)
-                frontal, width = res.frontality[i], res.transient_ms[i]
+                blink, muscle = res.blink_score[i], res.muscle_score[i]
                 for col, text in ((2, f"{100 * res.explained[i]:.1f}%"),
-                                  (3, "–" if not np.isfinite(frontal) else f"{frontal:.2f}"),
-                                  (4, f"{res.kurtosis[i]:.0f}"),
-                                  (5, f"{res.outlier_ratio[i]:.0f}"),
-                                  (6, "–" if not np.isfinite(width) else f"{width:.0f} ms"),
-                                  (7, f"{100 * res.high_freq[i]:.0f}%")):
+                                  (3, "–" if not np.isfinite(blink) else f"{blink:+.2f}"),
+                                  (4, "–" if not np.isfinite(muscle) else f"{muscle:.2f}")):
                     cell = QTableWidgetItem(text)
                     cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                     self.tbl_ica.setItem(i, col, cell)
             self.tbl_ica.resizeColumnsToContents()
+            self.tbl_ica.setColumnWidth(1, max(self.tbl_ica.columnWidth(1), 120))
         self._plot_ica()
 
     def _artifact_components(self) -> set[int]:
@@ -821,101 +781,145 @@ class MainWindow(QMainWindow):
         self._ica_labels = self._component_labels()
         self.tbl_ica.item(row, 0).setCheckState(
             Qt.Unchecked if text in proc.ARTIFACT_LABELS else Qt.Checked)
-        self._plot_ica()
+        if row < len(self._ica_rows):
+            self._ica_rows[row].setTitle(self._ica_title(row))
 
     def _plot_ica(self):
-        fig = self.cnv_ica.figure
-        fig.clear()
+        """One row per component with the panels of MNE's ``ICA.plot_properties``
+        on the filtered recording: scalp map; image of consecutive 2-s segments
+        (first at the bottom) over their average with its 95% confidence
+        interval; spectrum (mean ± SD over segments); variance of each segment."""
+        from scipy import stats
+
+        for row in self._ica_rows:
+            self.lay_ica.removeWidget(row)
+            row.deleteLater()
+        self._ica_rows = []
         res = self.ica
         if res is None:
-            self.cnv_ica.setMinimumHeight(0)
-            self.cnv_ica.draw_idle()
             return
-        n = res.n_components
-        sf = res.sfreq
-        self.cnv_ica.setMinimumHeight(170 * n + 40)
-        fig.set_size_inches(fig.get_figwidth(), (170 * n + 40) / fig.dpi)
-        grid = fig.add_gridspec(n, 3, width_ratios=[1, 2.4, 2.4])
+        props = proc.component_properties(res.ica, self.raw_pre)
         info = res.ica.info
         positioned = len(proc.eeg_with_positions(info)) == len(info.ch_names) >= 3
         patterns = res.ica.get_components()
-        offset = self._offset(self.raw_pre)  # times shown are recording times
-        a = max(0, int((self.spn_ica_t0.value() - offset) * sf))
-        b = min(res.sources.shape[1], a + int(self.spn_ica_len.value() * sf))
-        times = np.arange(a, b) / sf + offset
-        for i in range(n):
-            ax = fig.add_subplot(grid[i, 0])
+        cmap = pg.colormap.getFromMatplotlib("RdBu_r")
+        line, band = pg.mkPen("#9ec5ff", width=1.5), QColor(158, 197, 255, 60)
+        t = props.times
+        for i in range(res.n_components):
+            row = QGroupBox(self._ica_title(i))
+            lay = QHBoxLayout(row)
+
+            topo = MplCanvas(2.0)
+            topo.setFixedSize(170, 170)
+            ax = topo.figure.add_subplot()
             if positioned:
                 mne.viz.plot_topomap(patterns[:, i], info, axes=ax, show=False,
-                                     contours=0, sensors=True)
+                                     contours=4, sensors=True)
             else:
-                ax.text(0.5, 0.5, "no electrode\npositions", ha="center", va="center",
-                        fontsize=8)
+                ax.text(0.5, 0.5, "no electrode\npositions", ha="center", va="center")
                 ax.axis("off")
-            ax.set_title(f"IC{i:02d}\n{self._ica_labels[i]}", fontsize=8,
-                         color=matplotlib.rcParams["text.color"])
+            lay.addWidget(topo)
 
-            ax = fig.add_subplot(grid[i, 1])
-            ax.plot(times, res.sources[i, a:b], color="#9ec5ff", lw=0.7)
-            if len(times):
-                ax.set_xlim(times[0], times[-1])
-            ax.set_yticks([])
-            ax.tick_params(labelsize=7)
-            if i == 0:
-                ax.set_title("Time course", fontsize=9)
-            if i == n - 1:
-                ax.set_xlabel("Time (s)", fontsize=8)
+            charts = pg.GraphicsLayoutWidget()
+            charts.setMinimumHeight(330)
 
-            ax = fig.add_subplot(grid[i, 2])
-            freqs, ttimes, power = self._ica_spectra[i]
-            lo, hi = np.percentile(power, [5, 99])
-            ax.pcolormesh(ttimes + offset, freqs, power, shading="auto", cmap="magma",
-                          vmin=lo, vmax=hi, rasterized=True)
-            ax.set_ylim(1, freqs[-1])
-            ax.set_ylabel("Hz", fontsize=7)
-            ax.tick_params(labelsize=7)
-            if i == 0:
-                ax.set_title("Time–frequency (power, dB)", fontsize=9)
-            if i == n - 1:
-                ax.set_xlabel("Time (s)", fontsize=8)
-        self.cnv_ica.draw_idle()
+            def add_plot(**kwargs):
+                plot = charts.addPlot(**kwargs)
+                for side in ("left", "bottom"):  # values as they are, no ×0.001
+                    plot.getAxis(side).enableAutoSIPrefix(False)
+                return plot
+
+            segments = props.segments[:, i, :]
+            n_seg = len(segments)
+
+            image_plot = add_plot(row=0, col=0, title="2-s segments")
+            image = pg.ImageItem(segments.T)  # x: time, y: segment
+            # Colours saturate at the 99th percentile: the background stays
+            # visible and large deflections (blinks) stand out.
+            limit = float(np.percentile(np.abs(segments), 99)) or 1.0
+            image.setLookupTable(cmap.getLookupTable())
+            image.setLevels((-limit, limit))
+            image.setRect(0, 0, t[-1] + (t[1] - t[0]), n_seg)
+            image_plot.addItem(image)
+            image_plot.setLabel("left", "Segment")
+            image_plot.hideAxis("bottom")
+            image_plot.setXRange(0, t[-1], padding=0)
+            image_plot.setYRange(0, n_seg, padding=0)
+
+            erp_plot = add_plot(row=1, col=0)
+            mean = segments.mean(axis=0)
+            low, high = stats.t.interval(0.95, loc=mean, df=n_seg,
+                                         scale=stats.sem(segments, axis=0))
+            erp_plot.addItem(pg.FillBetweenItem(
+                pg.PlotCurveItem(t, high, pen=pg.mkPen(None)),
+                pg.PlotCurveItem(t, low, pen=pg.mkPen(None)), brush=band))
+            erp_plot.plot(t, mean, pen=line)
+            erp_plot.setXLink(image_plot)
+            erp_plot.setLabel("bottom", "Time in segment (s)")
+            erp_plot.setLabel("left", "Mean (AU)")
+
+            psd = props.psd_db[:, i, :]
+            psd_mean, psd_sd = psd.mean(axis=0), psd.std(axis=0)
+            spec_plot = add_plot(row=0, col=1, title="Spectrum")
+            spec_plot.addItem(pg.FillBetweenItem(
+                pg.PlotCurveItem(props.freqs, psd_mean + psd_sd, pen=pg.mkPen(None)),
+                pg.PlotCurveItem(props.freqs, psd_mean - psd_sd, pen=pg.mkPen(None)),
+                brush=band))
+            spec_plot.plot(props.freqs, psd_mean, pen=line)
+            if props.lowpass:
+                spec_plot.addItem(pg.InfiniteLine(props.lowpass, pen=pg.mkPen(
+                    "#888", style=Qt.DashLine)))
+            spec_plot.setLabel("bottom", "Frequency (Hz)")
+            spec_plot.setLabel("left", "Power (dB)")
+
+            variance = segments.var(axis=1)
+            var_plot = add_plot(row=1, col=1)
+            var_plot.plot(np.arange(n_seg), variance, pen=None, symbol="o",
+                          symbolSize=5, symbolBrush=QColor(158, 197, 255, 160),
+                          symbolPen=None)
+            var_plot.setLabel("bottom", "Segment")
+            var_plot.setLabel("left", "Variance (AU²)")
+
+            # Segments over their average | spectrum over segment variance.
+            charts.ci.layout.setRowStretchFactor(0, 2)
+            charts.ci.layout.setRowStretchFactor(1, 1)
+            charts.ci.layout.setColumnStretchFactor(0, 3)
+            charts.ci.layout.setColumnStretchFactor(1, 2)
+
+            lay.addWidget(charts, 1)
+            self.lay_ica.insertWidget(i, row)
+            self._ica_rows.append(row)
+
+    def _ica_title(self, i: int) -> str:
+        return f"ICA{i:03d} · {self._ica_labels[i]}"
 
     def fit_ica(self):
         if self.raw_pre is None:
             return
         with self._busy("Fitting ICA (EEG channels only)…"):
-            had_clean = self.raw_clean is not None
-            requested = self.spn_ncomp.value()
-            self.ica = proc.fit_ica(self.raw_pre, requested)
-            self._ica_spectra = [proc.component_spectrogram(s, self.ica.sfreq)
-                                 for s in self.ica.sources]
+            if self.events is None or not len(self.events):
+                raise InputError("Find the events in step 4 first: ICA is fitted on "
+                                 "the data from the first to the last trigger.")
+            had_erps = bool(self.evokeds)
+            segment = proc.event_time_range(self.raw_pre, self.events)
+            self.ica = proc.fit_ica(self.raw_pre, self.spn_ncomp.value(), segment)
             self._ica_labels = list(self.ica.labels)
             self._ica_excluded = []
             self.raw_clean = None
-            if had_clean:
-                self._invalidate("erp")
+            self._invalidate("ref")
             counts = {}
             for label in self._ica_labels:
                 counts[label] = counts.get(label, 0) + 1
             summary = ", ".join(f"{n} {label}" for label, n in counts.items())
-            text = f"{self.ica.n_components} components; review them in the ICA tab."
-            if self.ica.n_components < requested:
-                text += (f"<br><span style='color:#f5a54e'>{requested} requested, but the "
-                         f"data has rank {self.ica.n_components} (e.g. after an average "
-                         "reference).</span>")
-            self.lbl_ica.setText(text)
-            # Show the time course past the start-up drift of a recording.
-            duration = self.ica.sources.shape[1] / self.ica.sfreq
-            offset = self._offset(self.raw_pre)
-            self.spn_ica_t0.blockSignals(True)
-            self.spn_ica_t0.setRange(offset, offset + max(0.0, duration - 5))
-            self.spn_ica_t0.setValue(
-                offset + min(30.0, max(0.0, duration - self.spn_ica_len.value())))
-            self.spn_ica_t0.blockSignals(False)
+            self.lbl_ica.setText(
+                f"{self.ica.n_components} components, fitted on {segment[0]:.1f}–"
+                f"{segment[1]:.1f} s (first to last trigger); review them in the ICA tab.")
             self.tabs.setCurrentIndex(TAB_ICA)
             self.statusBar().showMessage(f"ICA: {self.ica.n_components} components "
                                          f"({summary}).")
         self._show_ica()
+        if self.ica is not None and had_erps:
+            self.compute_erps(quiet=True)
 
     def apply_ica(self):
         if self.ica is None:
@@ -928,9 +932,9 @@ class MainWindow(QMainWindow):
             removed = [i for i in range(self.ica.n_components) if i not in kept]
             self.raw_clean = proc.remove_components(self.raw_pre, self.ica.ica, removed)
             self._ica_excluded = removed
-            self._invalidate("erp")
+            self._invalidate("ref")
             labels = self._component_labels()
-            names = ", ".join(f"IC{i:02d} ({labels[i]})" for i in removed) or "none"
+            names = ", ".join(f"ICA{i:03d} ({labels[i]})" for i in removed) or "none"
             self.lbl_ica.setText(f"Reconstructed from {len(kept)} of "
                                  f"{self.ica.n_components} components.")
             self.cmb_stage.setCurrentIndex(2)
@@ -947,7 +951,7 @@ class MainWindow(QMainWindow):
         for i in range(self.tbl_ica.rowCount()):
             self.tbl_ica.item(i, 0).setCheckState(
                 Qt.Unchecked if i in artifacts else Qt.Checked)
-        self._invalidate("erp")
+        self._invalidate("ref")
         self.lbl_ica.setText("Using the filtered data with all components.")
         self.cmb_stage.setCurrentIndex(1)
         self._update_enabled()
@@ -975,13 +979,11 @@ class MainWindow(QMainWindow):
 
     def _update_enabled(self):
         loaded = self.raw_file is not None
-        for widget in (self.spn_start, self.spn_end, self.btn_range_events,
-                       self.btn_range_full, self.btn_range):
-            widget.setEnabled(loaded)
         self.btn_chans.setEnabled(loaded)
         self.btn_events.setEnabled(loaded)
         self.btn_filter.setEnabled(self.raw_orig is not None)
-        self.btn_ica.setEnabled(self.raw_pre is not None)
+        self.btn_ica.setEnabled(self.raw_pre is not None and self.events is not None
+                                and len(self.events) > 0)
         self.btn_ica_apply.setEnabled(self.ica is not None)
         self.btn_ica_reset.setEnabled(self.raw_clean is not None)
         self.btn_erp.setEnabled(self.raw_orig is not None and self.events is not None)
@@ -993,18 +995,28 @@ class MainWindow(QMainWindow):
             self._show_stats()  # clear results that no longer match the data
 
     def _current_raw(self) -> mne.io.BaseRaw | None:
+        """The data the reference and the epochs start from: ICA-cleaned,
+        else filtered, else as recorded."""
         for raw in (self.raw_clean, self.raw_pre, self.raw_orig):
             if raw is not None:
                 return raw
         return None
 
     def _invalidate(self, from_stage: str):
-        """Drop results that depend on a stage that just changed."""
+        """Drop results that depend on a stage that just changed.
+
+        Stages in processing order: "pre" (filtering), "ica" (its fit uses the
+        events), "ref" (reference, after ICA), "erp".
+        """
         if from_stage == "pre":
             self.raw_pre = None
+        if from_stage in ("pre", "ica"):
             self.ica = None
             self.raw_clean = None
+            self._ica_excluded = []
             self._show_ica()
+        if from_stage in ("pre", "ica", "ref"):
+            self.raw_ref = None
         self.epochs = None
         self.evokeds = {}
         self.stats = None
@@ -1060,7 +1072,7 @@ class MainWindow(QMainWindow):
         loaded = False
         with self._busy(f"Loading {path}…"):
             raw = proc.load_bdf(path)
-            self.raw_full = self.raw_file = raw
+            self.raw_file = raw
             self.path = path
             self.raw_orig = None
             self._stats_requested = False
@@ -1071,69 +1083,22 @@ class MainWindow(QMainWindow):
                 f"<b>{path.split('/')[-1]}</b><br>{len(raw.ch_names)} channels, "
                 f"{sf:g} Hz, {raw.times[-1]:.1f} s"
             )
-            for spin in (self.spn_start, self.spn_end):
-                spin.setRange(0, raw.times[-1])
             self.spn_lp.setMaximum(sf / 2 - 1)
             self.cmb_trigger.clear()
             self.cmb_trigger.addItems([proc.ANNOTATIONS] + raw.ch_names)
             self.cmb_trigger.setCurrentText(proc.guess_trigger_channel(raw))
             self.tbl_events.setRowCount(0)
             self._reset_channel_table()
+            self.sld_time.setRange(0, max(0, int(raw.times[-1]) - 1))
+            self.sld_time.setValue(0)
             self.cmb_stage.setCurrentIndex(0)
             loaded = True
         if loaded:
-            self._range_from_events()
-            self.apply_range()
-            self.statusBar().showMessage(
-                "Loaded. Check the time range, channels and trigger, select events, "
-                "then filter.")
-
-    def _range_from_events(self):
-        """Set the time range to the first and last events on the trigger channel."""
-        if self.raw_full is None:
-            return
-        try:
-            events, _ = proc.find_events(self.raw_full, self.cmb_trigger.currentText(),
-                                         self.spn_mask.value())
-        except Exception:  # e.g. a trigger channel that cannot be read as codes
-            events = np.empty((0, 3), int)
-        start, end = proc.event_time_range(self.raw_full, events)
-        self.spn_start.setValue(start)
-        self.spn_end.setValue(end)
-
-    def _range_full(self):
-        if self.raw_full is not None:
-            self.spn_start.setValue(0)
-            self.spn_end.setValue(self.raw_full.times[-1])
-
-    def _offset(self, raw: mne.io.BaseRaw) -> float:
-        """Start of ``raw`` in the recording (s), to show recording times."""
-        return (raw.first_samp - self.raw_full.first_samp) / raw.info["sfreq"]
-
-    def apply_range(self):
-        """Crop the recording to the time range; everything after starts over."""
-        if self.raw_full is None:
-            return
-        done = False
-        with self._busy("Applying the time range…"):
-            start, end = self.spn_start.value(), self.spn_end.value()
-            if end <= start:
-                raise InputError("The time range must end after it starts.")
-            self.raw_file = proc.crop(self.raw_full, start, end)
-            self.raw_orig = None
-            self.events = None
-            self._invalidate("pre")
-            offset = self._offset(self.raw_file)
-            self.sld_time.setRange(int(offset),
-                                   max(int(offset), int(offset + self.raw_file.times[-1]) - 1))
-            self.sld_time.setValue(int(offset))
-            done = True
-        if done:
             self.apply_channels()
             self.find_events()
             self.statusBar().showMessage(
-                f"Analysing {self.spn_start.value():.3f}-{self.spn_end.value():.3f} s "
-                f"({self.raw_file.times[-1]:.1f} s).")
+                "Loaded. Check channels, filter, check trigger and events, then "
+                "optionally run ICA.")
 
     def apply_channels(self):
         if self.raw_file is None:
@@ -1153,7 +1118,7 @@ class MainWindow(QMainWindow):
             self.raw_orig = raw
             self._invalidate("pre")
             n_eeg = len(mne.pick_types(raw.info, eeg=True))
-            # As many components as EEG channels, by default and at most.
+            # Until filtering gives the rank: as many components as EEG channels.
             self.spn_ncomp.setRange(2, max(2, n_eeg))
             self.spn_ncomp.setValue(max(2, n_eeg))
             n_pos = len(proc.eeg_with_positions(raw.info))
@@ -1181,6 +1146,13 @@ class MainWindow(QMainWindow):
             if cmb.findText(text) >= 0:
                 cmb.setCurrentText(text)
 
+    def _reference_changed(self, _text=None):
+        """A new reference applies to the next ERPs; computed ones are redone."""
+        had_erps = bool(self.evokeds)
+        self._invalidate("ref")
+        if had_erps:
+            self.compute_erps(quiet=True)
+
     def _reference_choice(self) -> str | list[str]:
         ref = self.cmb_ref.currentText()
         if ref in (proc.REF_NONE, proc.REF_AVERAGE):
@@ -1195,7 +1167,7 @@ class MainWindow(QMainWindow):
             events, event_id = proc.find_events(
                 self.raw_file, self.cmb_trigger.currentText(), self.spn_mask.value())
             self.events = events
-            self._invalidate("erp")
+            self._invalidate("ica")  # the ICA is fitted between the first and last events
             counts = proc.event_counts(events) if len(events) else {}
             names = {v: k for k, v in event_id.items()}
             # Keep the ticks and names of codes already listed (e.g. a new range).
@@ -1229,7 +1201,7 @@ class MainWindow(QMainWindow):
         self._plot_signals()
 
     def _delayed_events(self) -> np.ndarray:
-        """Events moved by the EEG delay set in step 5."""
+        """Events moved by the EEG delay set in step 4."""
         return proc.shift_events(self.events, self.spn_delay.value(),
                                  self.raw_file.info["sfreq"])
 
@@ -1257,8 +1229,7 @@ class MainWindow(QMainWindow):
     def preprocess(self):
         if self.raw_orig is None:
             return
-        with self._busy("Referencing and filtering with g.Pype…"):
-            ref = self._reference_choice()
+        with self._busy("Filtering…"):
             notch = {"off": None, "50 Hz": 50.0, "60 Hz": 60.0}[self.cmb_notch.currentText()]
             settings = proc.FilterSettings(
                 highpass=self.spn_hp.value() or None,
@@ -1267,12 +1238,13 @@ class MainWindow(QMainWindow):
                 order=self.spn_order.value(),
             )
             self._invalidate("pre")
-            referenced = proc.apply_reference(self.raw_orig, ref)
-            self.raw_pre = proc.apply_filter(referenced, settings)
+            self.raw_pre = proc.apply_filter(self.raw_orig, settings)
+            # As many components as the data has independent dimensions.
+            rank = max(2, proc.ica_rank(self.raw_pre))
+            self.spn_ncomp.setRange(2, rank)
+            self.spn_ncomp.setValue(rank)
             self.cmb_stage.setCurrentIndex(1)
-            ref_text = ref if isinstance(ref, str) else " + ".join(ref)
-            self.statusBar().showMessage(
-                f"Reference: {ref_text}; filtered ({settings.describe()}).")
+            self.statusBar().showMessage(f"Filtered ({settings.describe()}).")
         self._plot_signals()
 
     def compute_erps(self, _checked=False, quiet=False):
@@ -1287,14 +1259,17 @@ class MainWindow(QMainWindow):
         with self._busy("Epoching and averaging…"):
             events, event_id = self._selected_event_id()
             if not event_id:
-                raise InputError("Tick at least one event in step 5.")
+                raise InputError("Tick at least one event in step 4.")
+            if self.raw_ref is None:
+                self.raw_ref = proc.apply_reference(raw, self._reference_choice())
             settings = proc.EpochSettings(
                 tmin=self.spn_tmin.value(),
                 tmax=self.spn_tmax.value(),
                 baseline=(None, 0.0) if self.chk_baseline.isChecked() else None,
                 reject_uv=self.spn_reject.value() or None,
             )
-            self.epochs, self.evokeds = proc.compute_erps(raw, events, event_id, settings)
+            self.epochs, self.evokeds = proc.compute_erps(self.raw_ref, events, event_id,
+                                                          settings)
             total = {k: int((events[:, 2] == v).sum()) for k, v in event_id.items()}
             kept = {k: len(self.epochs[k]) if k in self.epochs.event_id else 0
                     for k in event_id}
@@ -1339,7 +1314,7 @@ class MainWindow(QMainWindow):
             raise InputError("Select at least one channel in step 2.")
         groups = self._event_groups()
         if not groups:
-            raise InputError("Tick at least one event in step 5.")
+            raise InputError("Tick at least one event in step 4.")
         raw = self.raw_file
 
         annotations = trigger == proc.ANNOTATIONS
@@ -1372,7 +1347,6 @@ class MainWindow(QMainWindow):
                 condition_a=a,
                 condition_b=b,
                 polarity=-1 if self.cmb_polarity.currentText() == "negative" else 1,
-                n_permutations=self.spn_perm.value(),
             )
 
         labels = proc.electrode_labels()
@@ -1401,8 +1375,6 @@ class MainWindow(QMainWindow):
             topomap_latency=round(self.latency, 3),
             # Topomaps need positions for every EEG channel the script plots.
             topomap_ok=len(positioned) >= 3 and len(positioned) == len(eeg),
-            time_range=(None if raw is self.raw_full else
-                        (self.spn_start.value(), self.spn_end.value())),
         )
 
     def export_script(self):
@@ -1450,7 +1422,8 @@ class MainWindow(QMainWindow):
     def _plot_signals(self):
         plot = self.plt_signals
         plot.clear()
-        raw = [self.raw_orig, self.raw_pre, self.raw_clean][self.cmb_stage.currentIndex()]
+        raw = [self.raw_orig, self.raw_pre, self.raw_clean,
+               self.raw_ref][self.cmb_stage.currentIndex()]
         if raw is None:
             raw = self._current_raw()
         if raw is None:
@@ -1458,18 +1431,16 @@ class MainWindow(QMainWindow):
         picks = mne.pick_types(raw.info, eeg=True, eog=True, emg=True, ecg=True,
                                misc=True)
         sf = raw.info["sfreq"]
-        offset = self._offset(raw)  # times shown are recording times
         t0 = float(self.sld_time.value())
         dur = self.spn_window.value()
-        a = max(0, int((t0 - offset) * sf))
-        b = min(raw.n_times, int((t0 + dur - offset) * sf))
+        a, b = int(t0 * sf), min(raw.n_times, int((t0 + dur) * sf))
         if b <= a or not len(picks):
             return
         data = raw.get_data(picks=picks, start=a, stop=b) * 1e6
         if raw is self.raw_orig:
             data = data - data.mean(axis=1, keepdims=True)  # hide DC offsets
         step = max(1, (b - a) // 4000)
-        times = raw.times[a:b:step] + offset
+        times = raw.times[a:b:step]
         data = data[:, ::step]
         scale = self.spn_scale.value()
         ticks = []
@@ -1484,7 +1455,7 @@ class MainWindow(QMainWindow):
             ev = events[(events[:, 0] - raw.first_samp >= a) &
                         (events[:, 0] - raw.first_samp < b)]
             for s, _, code in ev:
-                t = (s - raw.first_samp) / sf + offset
+                t = (s - raw.first_samp) / sf
                 plot.addItem(pg.InfiniteLine(t, pen=pg.mkPen("#5fd38d", style=Qt.DashLine)))
                 label = pg.TextItem(str(code), color="#5fd38d", anchor=(0, 1))
                 label.setPos(t, 1.4)
@@ -1511,15 +1482,18 @@ class MainWindow(QMainWindow):
                               name=f"{name} (n={ev.nave})" if i == 0 else None)
                 continue
             if view == "GFP":
-                eeg = mne.pick_types(ev.info, eeg=True)
-                trace = data[eeg].std(axis=0)
+                # Global field power: the SD across EEG electrodes.
+                eeg = list(mne.pick_types(ev.info, eeg=True))
+                trace = mne.channels.combine_channels(
+                    ev, {"gfp": eeg}, method="std", verbose="error").data[0] * 1e6
                 label = f"{name} GFP (n={ev.nave})"
             else:
                 chans = selected or [ev.ch_names[0]]
                 if view == "Single channel":
                     chans = chans[:1]
                 idx = [ev.ch_names.index(ch) for ch in chans]
-                trace = data[idx].mean(axis=0)
+                trace = mne.channels.combine_channels(
+                    ev, {"roi": idx}, method="mean", verbose="error").data[0] * 1e6
                 where = chans[0] if len(chans) == 1 else f"mean of {len(chans)}"
                 label = f"{name} @ {where} (n={ev.nave})"
             plot.plot(ev.times, trace, pen=pg.mkPen(color, width=2), name=label)

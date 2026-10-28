@@ -21,7 +21,6 @@ class Component:
     condition_a: str
     condition_b: str
     polarity: int  # -1: negative-going peak, +1: positive-going
-    n_permutations: int
 
 
 @dataclass
@@ -50,7 +49,6 @@ class AnalysisConfig:
     ica_file: str | None = None  # the ICA fitted in the app, saved by the export
     ica_exclude: list[int] = field(default_factory=list)  # components to remove
     ica_labels: dict[int, str] = field(default_factory=dict)  # their labels
-    time_range: tuple[float, float] | None = None  # s from the start; None = all
 
 
 def _py(value) -> str:
@@ -75,14 +73,12 @@ def build_script(cfg: AnalysisConfig) -> str:
 
     # ---------------------------------------------------------------- header
     steps = [
-        "1. Load the recording (the time range analysed) and find the trigger events."
-        if cfg.time_range else "1. Load the recording and find the trigger events.",
+        "1. Load the recording and find the trigger events.",
         "2. Keep the selected channels, name them after their electrodes and add",
         "   standard 10-05 electrode positions.",
-        "3. Re-reference (optional) and filter.",
+        "3. Filter" + (", remove the independent components rejected on inspection"
+                       if cfg.ica_file else "") + ", then re-reference (optional).",
     ]
-    if cfg.ica_file:
-        steps.append("   Remove the independent components rejected on inspection.")
     steps += [
         "4. Cut epochs around the events and average them into ERPs.",
     ]
@@ -108,10 +104,6 @@ def build_script(cfg: AnalysisConfig) -> str:
     # ---------------------------------------------------------------- settings
     add("# --- Settings (edit these) " + "-" * 50)
     add(f"RECORDING = {cfg.recording!r}")
-    if cfg.time_range:
-        add("# Part of the recording to analyse: start and end, s from its start")
-        add(f"TIME_RANGE = ({_py(float(cfg.time_range[0]))}, "
-            f"{_py(float(cfg.time_range[1]))})")
     add("")
     add("# Channels to keep: name in the recording -> electrode name (10-05 system)")
     add(f"CHANNELS = {_dict(cfg.channels)}")
@@ -137,11 +129,12 @@ def build_script(cfg: AnalysisConfig) -> str:
         add(f"LINE_NOISE = {_py(cfg.notch)}  # Hz, removed with a +-2 Hz band-stop")
     if cfg.ica_file:
         add("")
-        add("# ICA: the decomposition fitted in Rhino ERP (extended Infomax on the EEG")
-        add("# channels, high-passed at 1 Hz), saved next to this script, and the")
-        add("# components removed after visual inspection:")
+        add("# ICA: the decomposition fitted in Rhino ERP (extended Infomax on the")
+        add("# filtered EEG channels from the first to the last trigger, high-passed at")
+        add("# 1 Hz), saved next to this script, and the components removed after visual")
+        add("# inspection:")
         for i in cfg.ica_exclude:
-            add(f"#   IC{i:02d}: {cfg.ica_labels.get(i, 'removed')}")
+            add(f"#   ICA{i:03d}: {cfg.ica_labels.get(i, 'removed')}")
         add(f"ICA_FILE = {cfg.ica_file!r}")
         add(f"REMOVED_COMPONENTS = {cfg.ica_exclude!r}")
     add("")
@@ -158,7 +151,6 @@ def build_script(cfg: AnalysisConfig) -> str:
         add(f"WINDOW = ({_py(comp.tmin)}, {_py(comp.tmax)})  # s")
         add(f"POLARITY = {comp.polarity}  # -1: the peak is negative-going, +1: positive")
         add(f"CONDITION_A, CONDITION_B = {comp.condition_a!r}, {comp.condition_b!r}")
-        add(f"N_PERMUTATIONS = {comp.n_permutations}  # for the permutation test")
     elif cfg.topomap_ok:
         add(f"TOPOMAP_TIME = {_py(cfg.topomap_latency)}  # s")
     add("")
@@ -167,8 +159,6 @@ def build_script(cfg: AnalysisConfig) -> str:
     add(_section("1. Load the recording and find the events"))
     reader = "read_raw_bdf" if cfg.recording.lower().endswith(".bdf") else "read_raw_edf"
     add(f"raw = mne.io.{reader}(RECORDING, preload=True)")
-    if cfg.time_range:
-        add("raw.crop(*TIME_RANGE)")
     if cfg.trigger_channel:
         if not cfg.trigger_is_stim:
             add("# The reader types every channel as EEG; mark the trigger channel as a")
@@ -184,10 +174,9 @@ def build_script(cfg: AnalysisConfig) -> str:
             add("raw.apply_function(lambda x: np.round(x), picks=TRIGGER_CHANNEL)")
         mask = (f", mask={hex(cfg.trigger_mask)}, mask_type=\"and\""
                 if cfg.trigger_mask else "")
-        # A range may start on an event: count it, as the app does.
-        initial = ", initial_event=True" if cfg.time_range else ""
+        add("# Every change to a non-zero code is an event, also one at the first sample.")
         add("events = mne.find_events(raw, stim_channel=TRIGGER_CHANNEL, "
-            f"shortest_event=1, consecutive=True{initial}{mask})")
+            f"shortest_event=1, consecutive=True, initial_event=True{mask})")
         add("# Tag each code with its condition: epochs['name'] then selects all of them.")
         add("event_id = {f\"{name}/{code}\": code")
         add("            for name, codes in CONDITIONS.items() for code in codes}")
@@ -197,7 +186,8 @@ def build_script(cfg: AnalysisConfig) -> str:
         add("event_id = {f\"{name}/{description}\": codes[description]")
         add("            for name, descriptions in CONDITIONS.items()")
         add("            for description in descriptions}")
-    add('events[:, 0] += round(EEG_DELAY_MS * raw.info["sfreq"] / 1000)\n')
+    add('events = mne.event.shift_time_events(events, None, EEG_DELAY_MS / 1000, '
+        'raw.info["sfreq"])\n')
 
     # ---------------------------------------------------------------- 2. channels
     add(_section("2. Channels and electrode positions"))
@@ -209,10 +199,8 @@ def build_script(cfg: AnalysisConfig) -> str:
         "MNE 1.13\n")
 
     # ---------------------------------------------------------------- 3. filter
-    add(_section("3. Reference, filters and ICA" if cfg.ica_file
-                 else "3. Reference and filters"))
-    if cfg.reference != "none":
-        add("raw.set_eeg_reference(REFERENCE)")
+    add(_section("3. Filters, ICA and reference" if cfg.ica_file
+                 else "3. Filters and reference"))
     if cfg.highpass or cfg.lowpass or cfg.notch:
         add(f'butterworth = dict(ftype="butter", order={cfg.filter_order})')
     if cfg.highpass or cfg.lowpass:
@@ -226,6 +214,10 @@ def build_script(cfg: AnalysisConfig) -> str:
         add("# Reconstruct the EEG from the remaining components.")
         add("ica = mne.preprocessing.read_ica(ICA_FILE)")
         add("ica.apply(raw, exclude=REMOVED_COMPONENTS)")
+    if cfg.reference != "none":
+        add("")
+        add("# Re-reference after ICA.")
+        add("raw.set_eeg_reference(REFERENCE)")
     add("")
 
     # ---------------------------------------------------------------- 4. epochs
@@ -280,89 +272,55 @@ def build_script(cfg: AnalysisConfig) -> str:
         add(_section("6. Statistics: condition A vs condition B"))
         add("# Single trials, averaged over the component channels, in µV.")
         add("# Trials are the observations: these are single-subject statistics.")
-        add("a = epochs[CONDITION_A].get_data(picks=COMPONENT_CHANNELS).mean(axis=1) * 1e6")
-        add("b = epochs[CONDITION_B].get_data(picks=COMPONENT_CHANNELS).mean(axis=1) * 1e6")
+        add("def channel_mean(inst):")
+        add("    picks = [inst.ch_names.index(name) for name in COMPONENT_CHANNELS]")
+        add('    return mne.channels.combine_channels(inst, {"roi": picks}, method="mean")\n')
+        add("a = channel_mean(epochs[CONDITION_A]).get_data()[:, 0] * 1e6")
+        add("b = channel_mean(epochs[CONDITION_B]).get_data()[:, 0] * 1e6")
         add("n_a, n_b = len(a), len(b)")
         add("times = epochs.times")
         add("window = (times >= WINDOW[0]) & (times <= WINDOW[1])\n")
-        add("# Mean amplitude in the window, per trial. These tests are only valid if the")
+        add("# Mean amplitude in the window, per trial. The test is only valid if the")
         add("# window was chosen before looking at the data.")
         add("amp_a, amp_b = a[:, window].mean(axis=1), b[:, window].mean(axis=1)")
         add("difference = amp_a.mean() - amp_b.mean()\n")
-        add("# (a) Welch's t-test (no equal-variance assumption).")
+        add("# Welch's t-test (two-sided, no equal-variance assumption).")
         add("welch = stats.ttest_ind(amp_a, amp_b, equal_var=False)\n")
-        add("# (b) Permutation test: shuffle the condition labels and count how often a")
-        add("#     difference at least as large arises by chance (two-sided).")
-        add("rng = np.random.default_rng(0)")
-        add("pooled = np.concatenate([amp_a, amp_b])")
-        add("shuffled = pooled[[rng.permutation(len(pooled)) for _ in range(N_PERMUTATIONS)]]")
-        add("null = shuffled[:, :n_a].mean(axis=1) - shuffled[:, n_a:].mean(axis=1)")
-        add("p_permutation = (np.sum(np.abs(null) >= abs(difference)) + 1) / "
-            "(N_PERMUTATIONS + 1)\n")
-        add("# (c) Effect size: Hedges' g (Cohen's d with a small-sample correction).")
-        add("pooled_sd = np.sqrt(((n_a - 1) * amp_a.var(ddof=1) + (n_b - 1) * "
-            "amp_b.var(ddof=1))")
-        add("                    / (n_a + n_b - 2))")
-        add("hedges_g = difference / pooled_sd * (1 - 3 / (4 * (n_a + n_b) - 9))\n")
-        add("# (d) Peak amplitude and latency on each condition's average ERP: the most")
-        add("#     negative (or positive) point in the window. A 'peak' on the window edge")
-        add("#     is just a slope, so there is no clear peak.")
-        add("def peak(erp):")
-        add("    i = np.argmax(erp[window] * POLARITY)")
-        add("    latency = times[window][i]")
-        add("    on_edge = i in (0, window.sum() - 1)")
-        add("    return erp[window][i], latency, on_edge\n")
-        add("peak_a, peak_b = peak(a.mean(axis=0)), peak(b.mean(axis=0))\n")
-        add("# (e) Latency difference, tested with the jackknife (Miller et al., 1998):")
-        add("#     single-trial peaks are too noisy, so the peak is measured on")
-        add("#     leave-one-out averages and the t statistic corrected for their")
-        add("#     reduced variance. Only meaningful when both conditions have a peak.")
-        add("def leave_one_out_latencies(x):")
-        add("    return np.array([peak((x.sum(axis=0) - trial) / (len(x) - 1))[1] for trial in x])\n")
-        add("latency_difference = peak_a[1] - peak_b[1]")
-        add("p_latency = np.nan")
-        add("if not (peak_a[2] or peak_b[2]):")
-        add("    jack_a, jack_b = leave_one_out_latencies(a), leave_one_out_latencies(b)")
-        add("    se = np.sqrt((n_a - 1) / n_a * np.sum((jack_a - jack_a.mean()) ** 2)")
-        add("                 + (n_b - 1) / n_b * np.sum((jack_b - jack_b.mean()) ** 2))")
-        add("    if se > 0:")
-        add("        p_latency = 2 * stats.t.sf(abs(latency_difference / se), n_a + n_b - 2)\n")
-        add("def describe_peak(amplitude, latency, on_edge):")
-        add('    edge = " (window edge: no clear peak)" if on_edge else ""')
-        add('    return f"{amplitude:+.2f} µV at {latency * 1000:.0f} ms{edge}"\n')
+        add("# Peak amplitude and latency on each condition's average ERP: the most")
+        add("# negative (or positive) point in the window.")
+        add("def peak(condition):")
+        add("    _, latency, amplitude = channel_mean(epochs[condition].average()).get_peak(")
+        add('        tmin=WINDOW[0], tmax=WINDOW[1], mode="neg" if POLARITY < 0 else "pos",')
+        add("        return_amplitude=True, strict=False)")
+        add("    return amplitude * 1e6, latency\n")
+        add("peak_a, peak_b = peak(CONDITION_A), peak(CONDITION_B)\n")
         add('print(f"\\n{COMPONENT} at {\'+\'.join(COMPONENT_CHANNELS)}, "')
         add('      f"{WINDOW[0] * 1000:.0f}-{WINDOW[1] * 1000:.0f} ms")')
-        add('print(f"  {CONDITION_A}: n = {n_a}, mean {amp_a.mean():+.2f} ± "')
-        add('      f"{amp_a.std(ddof=1) / np.sqrt(n_a):.2f} µV, peak {describe_peak(*peak_a)}")')
-        add('print(f"  {CONDITION_B}: n = {n_b}, mean {amp_b.mean():+.2f} ± "')
-        add('      f"{amp_b.std(ddof=1) / np.sqrt(n_b):.2f} µV, peak {describe_peak(*peak_b)}")')
+        add('for name, n, amp, (pk, lat) in ((CONDITION_A, n_a, amp_a, peak_a),')
+        add('                                (CONDITION_B, n_b, amp_b, peak_b)):')
+        add('    print(f"  {name}: n = {n}, mean {amp.mean():+.2f} ± "')
+        add('          f"{amp.std(ddof=1) / np.sqrt(n):.2f} µV, peak {pk:+.2f} µV at "')
+        add('          f"{lat * 1000:.0f} ms")')
         add('print(f"  difference {difference:+.2f} µV: Welch t({welch.df:.1f}) = "')
-        add('      f"{welch.statistic:.2f}, p = {welch.pvalue:.4f}; permutation p = "')
-        add('      f"{p_permutation:.4f} ({N_PERMUTATIONS}); Hedges\' g = {hedges_g:+.2f}")')
-        add("if np.isnan(p_latency):")
-        add('    print("  latency difference: not testable (no clear peak in both)")')
-        add("else:")
-        add('    print(f"  latency difference {latency_difference * 1000:+.0f} ms, "')
-        add('          f"jackknife p = {p_latency:.4f}")\n')
+        add('      f"{welch.statistic:.2f}, p = {welch.pvalue:.4f}; latency difference "')
+        add('      f"{(peak_a[1] - peak_b[1]) * 1000:+.0f} ms")\n')
         add("# Graph: mean ± standard error of both conditions, the component window")
-        add("# (grey) and each condition's peak (dot, when there is a clear one).")
+        add("# (grey) and each condition's peak (dot).")
         add("fig, ax = plt.subplots(figsize=(9, 4.5), layout=\"constrained\")")
-        add('for x, (amp, lat, edge), name, color in ((a, peak_a, CONDITION_A, "#eb6834"),')
-        add('                                          (b, peak_b, CONDITION_B, "#2a78d6")):')
+        add('for x, (amp, lat), name, color in ((a, peak_a, CONDITION_A, "#eb6834"),')
+        add('                                   (b, peak_b, CONDITION_B, "#2a78d6")):')
         add("    mean, se = x.mean(axis=0), x.std(axis=0, ddof=1) / np.sqrt(len(x))")
         add('    ax.plot(times * 1000, mean, color=color, lw=2, label=f"{name} (n={len(x)})")')
         add("    ax.fill_between(times * 1000, mean - se, mean + se, color=color, alpha=0.2, "
             "lw=0)")
-        add("    if not edge:")
-        add('        ax.plot(lat * 1000, amp, "o", color=color, markeredgecolor="black")')
+        add('    ax.plot(lat * 1000, amp, "o", color=color, markeredgecolor="black")')
         add('ax.axvspan(WINDOW[0] * 1000, WINDOW[1] * 1000, color="0.85", zorder=0,')
         add('           label=f"{COMPONENT} window")')
         add('ax.axhline(0, color="0.5", lw=0.8)')
         add('ax.axvline(0, color="0.5", lw=0.8, ls="--")')
         add('ax.set(xlabel="Time (ms)", ylabel="Amplitude (µV)",')
         add("       title=f\"{COMPONENT} at {', '.join(COMPONENT_CHANNELS)}: \"")
-        add('             f"t = {welch.statistic:.2f}, p = {welch.pvalue:.3f}, "')
-        add('             f"permutation p = {p_permutation:.3f}")')
+        add('             f"t({welch.df:.1f}) = {welch.statistic:.2f}, p = {welch.pvalue:.3f}")')
         add('ax.legend(frameon=False, loc="upper left")\n')
 
     add("plt.show()")

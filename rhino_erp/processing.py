@@ -1,8 +1,8 @@
-"""Offline ERP processing: loading, channels, events, filtering, ERPs.
+"""Offline ERP processing: loading, channels, events, filtering, ICA, ERPs.
 
 Everything here is Qt-free so it can be scripted or tested on its own.
-MNE handles file I/O, epoching and averaging; the filtering runs through
-a g.Pype batch pipeline (zero-phase Butterworth sections).
+All processing is done with MNE functions, so the exported MNE script
+can repeat it exactly; the one exception is the Welch t-test (SciPy).
 """
 
 from __future__ import annotations
@@ -11,12 +11,6 @@ from dataclasses import dataclass
 
 import mne
 import numpy as np
-
-import gpype as gp
-from gpype.backend.sources.base.recording_reader import (
-    Recording,
-    RecordingReader,
-)
 
 # ---------------------------------------------------------------------------
 # Loading
@@ -155,23 +149,23 @@ def find_events(
 ) -> tuple[np.ndarray, dict[str, int]]:
     """Return MNE-style events and a name->code map.
 
-    Any channel can carry the triggers: its values are converted back to
-    the units stored in the file, rounded to integer codes, masked, and
-    every change to a non-zero code is an event onset. With
-    ``ANNOTATIONS`` the file's annotations are used instead.
+    Any channel can carry the triggers: a copy of it is typed as a stim
+    channel, its values converted back to the units stored in the file and
+    rounded to whole codes (``mne.find_events`` would truncate 19.99 to 19),
+    then ``mne.find_events`` takes every change to a non-zero code as an
+    event, including one at the very first sample. With ``ANNOTATIONS``
+    the file's annotations are used instead.
     """
     if trigger_channel == ANNOTATIONS:
         events, event_id = mne.events_from_annotations(raw, verbose="error")
         return events, {k: int(v) for k, v in event_id.items()}
-    values = raw.get_data(picks=[trigger_channel])[0] * trigger_scale(raw, trigger_channel)
-    codes = np.rint(values).astype(np.int64)
-    if mask:
-        codes &= mask
-    previous = np.concatenate([[0], codes[:-1]])
-    onsets = np.flatnonzero((codes != previous) & (codes != 0))
-    events = np.column_stack(
-        [onsets + raw.first_samp, previous[onsets], codes[onsets]]
-    ).astype(int)
+    scale = trigger_scale(raw, trigger_channel)
+    trig = raw.copy().pick([trigger_channel])
+    trig.set_channel_types({trigger_channel: "stim"}, verbose="error")
+    trig.apply_function(lambda x: np.round(x * scale), picks=[trigger_channel])
+    events = mne.find_events(
+        trig, stim_channel=trigger_channel, shortest_event=1, consecutive=True,
+        initial_event=True, mask=mask or None, mask_type="and", verbose="error")
     found = sorted(set(events[:, 2].tolist()))
     return events, {str(c): int(c) for c in found}
 
@@ -181,13 +175,9 @@ def shift_events(events: np.ndarray, delay_ms: float, sfreq: float) -> np.ndarra
 
     A positive delay means the EEG lags the triggers (e.g. wireless
     transmission), so each event is moved that much later; a negative one
-    moves events earlier. Shifting the events is equivalent to shifting
-    the EEG the other way, and needs no padding at the recording edges --
-    epochs that no longer fit are simply dropped by MNE.
+    moves events earlier. Epochs that no longer fit are dropped by MNE.
     """
-    shifted = events.copy()
-    shifted[:, 0] += int(round(delay_ms * sfreq / 1000.0))
-    return shifted
+    return mne.event.shift_time_events(events, None, delay_ms / 1000.0, sfreq)
 
 
 def group_events(
@@ -197,7 +187,6 @@ def group_events(
 
     A condition pooling several codes gets one new code of its own.
     """
-    events = events.copy()
     event_id = {}
     for name, codes in groups.items():
         if len(codes) == 1:
@@ -239,27 +228,7 @@ def event_counts(events: np.ndarray) -> dict[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Filtering with g.Pype
-
-
-class _ArrayReader(RecordingReader):
-    """g.Pype source that emits an in-memory array as one batch block."""
-
-    _pending: Recording | None = None
-
-    def __init__(self, data: np.ndarray, sfreq: float, labels, **kwargs):
-        # _load() is called from the base constructor, so stage the data
-        # on the class first.
-        _ArrayReader._pending = Recording(
-            samples=np.ascontiguousarray(data, dtype=np.float32),
-            labels=list(labels),
-            sampling_rate=float(sfreq),
-        )
-        super().__init__(file_name="<memory>", mode="batch", **kwargs)
-
-    def _load(self, file_name: str) -> Recording:
-        recording, _ArrayReader._pending = _ArrayReader._pending, None
-        return recording
+# Filtering
 
 
 @dataclass
@@ -278,44 +247,6 @@ class FilterSettings:
         if self.notch:
             parts.append(f"notch {self.notch:g} Hz")
         return ", ".join(parts) or "no filter"
-
-
-def gpype_filter(
-    data: np.ndarray, sfreq: float, labels, settings: FilterSettings
-) -> np.ndarray:
-    """Zero-phase filter ``(channel, time)`` data with a g.Pype pipeline."""
-    nodes = []
-    hp, lp, order = settings.highpass, settings.lowpass, settings.order
-    nyq = sfreq / 2
-    if lp and lp >= nyq:
-        raise ValueError(f"Low-pass {lp} Hz must be below Nyquist ({nyq} Hz).")
-    if hp and lp:
-        if hp >= lp:
-            raise ValueError("High-pass cutoff must be below low-pass cutoff.")
-        nodes.append(gp.Bandpass(f_lo=hp, f_hi=lp, order=order, phase="zero"))
-    elif hp:
-        nodes.append(gp.Highpass(f_c=hp, order=order, phase="zero"))
-    elif lp:
-        nodes.append(gp.Lowpass(f_c=lp, order=order, phase="zero"))
-    if settings.notch and settings.notch < nyq - 2:
-        f = settings.notch
-        nodes.append(gp.Bandstop(f_lo=f - 2, f_hi=f + 2, order=2, phase="zero"))
-    if not nodes:
-        return data.copy()
-
-    # Remove DC first: BioSemi data carries large offsets, which would
-    # otherwise ring at the edges of the high-pass.
-    offset = data.mean(axis=1, keepdims=True)
-    pipeline = gp.Pipeline()
-    previous = _ArrayReader((data - offset).T, sfreq, labels)
-    for node in nodes:
-        pipeline.connect(previous, node)
-        previous = node
-    pipeline.connect(previous, gp.Collector(name="out"))
-    result = pipeline.run()
-    if isinstance(result, dict):
-        result = result["out"]
-    return np.asarray(result.data, dtype=np.float64).T
 
 
 REF_NONE = "none (as recorded)"
@@ -337,15 +268,26 @@ def apply_reference(raw: mne.io.BaseRaw, ref: str | list[str]) -> mne.io.BaseRaw
 
 
 def apply_filter(raw: mne.io.BaseRaw, settings: FilterSettings) -> mne.io.BaseRaw:
-    """Return a filtered copy of ``raw``; stim channels are left untouched."""
+    """Return a filtered copy of ``raw``; stim channels are left untouched.
+
+    MNE zero-phase IIR Butterworth filters: a high-pass and/or low-pass of
+    the given order, and a band-stop of order 2 at the line frequency ±2 Hz.
+    """
     out = raw.copy()
-    picks = mne.pick_types(out.info, eeg=True, eog=True, emg=True, ecg=True,
-                           misc=True)
-    if len(picks):
-        labels = [out.ch_names[i] for i in picks]
-        out._data[picks] = gpype_filter(
-            out._data[picks], out.info["sfreq"], labels, settings
-        )
+    hp, lp = settings.highpass, settings.lowpass
+    nyq = out.info["sfreq"] / 2
+    if lp and lp >= nyq:
+        raise ValueError(f"Low-pass {lp} Hz must be below Nyquist ({nyq} Hz).")
+    if hp and lp and hp >= lp:
+        raise ValueError("High-pass cutoff must be below low-pass cutoff.")
+    if hp or lp:
+        out.filter(hp, lp, method="iir",
+                   iir_params=dict(ftype="butter", order=settings.order), verbose="error")
+    if settings.notch and settings.notch < nyq - 2:
+        f = settings.notch
+        # A band-stop is a filter whose low edge lies above its high edge.
+        out.filter(f + 2, f - 2, method="iir", iir_params=dict(ftype="butter", order=2),
+                   verbose="error")
     return out
 
 
@@ -365,19 +307,22 @@ COMPONENT_LABELS = ("EEG", "Eye blink", "Muscle (EMG)", "Line noise",
 ARTIFACT_LABELS = ("Eye blink", "Muscle (EMG)", "Line noise", "Channel noise")
 
 
+#: Blink detection: absolute correlation of a component with the most
+#: anterior EEG electrode (1-10 Hz), above which it is labelled a blink.
+BLINK_CORRELATION = 0.8
+#: Muscle detection: MNE's muscle score above which it is labelled muscle.
+MUSCLE_SCORE = 0.5
+
+
 @dataclass
 class ICAResult:
     ica: mne.preprocessing.ICA
     sources: np.ndarray  # (n_components, n_times) component time courses
     sfreq: float
-    explained: np.ndarray  # fraction of EEG variance per component
-    frontality: np.ndarray  # weight at the most anterior electrodes, 0-1
-    focality: np.ndarray  # largest channel weight over the sum of weights
-    kurtosis: np.ndarray  # median excess kurtosis over 10-s windows
-    high_freq: np.ndarray  # share of 1-40 Hz power above 20 Hz
-    line_ratio: np.ndarray  # power at 50/60 Hz over its neighbourhood
-    transient_ms: np.ndarray  # median duration of the large deflections (nan: none)
-    outlier_ratio: np.ndarray  # variance over robust (MAD-based) variance
+    explained: np.ndarray  # fraction of EEG variance per component (MNE)
+    frontal_channel: str | None  # the blink proxy; None without positions
+    blink_score: np.ndarray  # correlation with the frontal channel (nan: none)
+    muscle_score: np.ndarray  # MNE's muscle score (nan: not computable)
     labels: list[str]  # suggested label per component
 
     @property
@@ -385,64 +330,13 @@ class ICAResult:
         return len(self.explained)
 
 
-#: Deflections of a blink component last this long (ms).
-BLINK_MS = (150.0, 500.0)
-#: Excess kurtosis above which a time course is too spiky to be brain activity.
-SPIKY_KURTOSIS = 20.0
-#: Kurtosis is measured in windows of this length (s) and the median taken,
-#: so a few large transients (e.g. at the start of a recording) do not make
-#: an otherwise clean component look spiky.
-KURTOSIS_WINDOW = 10.0
-#: Variance over robust variance above which rare, large events dominate a
-#: component (1-3 for EEG).
-OUTLIER_RATIO = 20.0
-
-
-def suggest_label(frontality, focality, kurtosis, high_freq, line_ratio,
-                  explained, n_channels, transient_ms, outlier_ratio) -> str:
-    """A first guess at what a component is, from the EEG alone.
-
-    Eye blinks peak at the most anterior electrode and are large, slow
-    deflections of 150-500 ms carrying at least 1% of the variance; muscle
-    activity is broadband and strong above 20 Hz; line noise is a narrow
-    peak at 50 or 60 Hz. A component that sits on a single electrode is
-    taken as channel noise. So is one that is spiky throughout, or whose
-    variance comes from rare, large events, when those events are shorter
-    than 100 ms (electrode pops); otherwise it is "Other". The rest is
-    taken to be brain activity. A guess to check, not a
-    classification.
-    """
-    lo, hi = BLINK_MS
-    if (np.isfinite(frontality) and frontality >= 0.9 and kurtosis > 5
-            and high_freq < 0.3 and explained >= 0.01
-            and np.isfinite(transient_ms) and lo <= transient_ms <= hi):
-        return "Eye blink"
-    if line_ratio > 5:
-        return "Line noise"
-    if high_freq > 0.4:
-        return "Muscle (EMG)"
-    if n_channels >= 4 and focality > 0.45:
-        return "Channel noise"
-    if kurtosis > SPIKY_KURTOSIS or outlier_ratio > OUTLIER_RATIO:
-        if np.isfinite(transient_ms) and transient_ms < 100:
-            return "Channel noise"
-        return "Other"
-    return "EEG"
-
-
-def _transient_ms(source: np.ndarray, sfreq: float) -> float:
-    """Median duration of a time course's large deflections, in ms.
-
-    A deflection is a run beyond 4 robust SDs that reaches 8 somewhere;
-    nan if there is none.
-    """
-    mad = 1.4826 * np.median(np.abs(source - np.median(source)))
-    if mad == 0:
-        return np.nan
-    z = np.abs(source - np.median(source)) / mad
-    edges = np.flatnonzero(np.diff(np.r_[0, (z > 4).astype(int), 0]))
-    widths = [b - a for a, b in zip(edges[::2], edges[1::2]) if z[a:b].max() > 8]
-    return 1000 * np.median(widths) / sfreq if widths else np.nan
+def frontal_channel(info: mne.Info) -> str | None:
+    """The most anterior EEG electrode with a position, the blink proxy."""
+    picks = eeg_with_positions(info)
+    if not len(picks):
+        return None
+    y = [info["chs"][i]["loc"][1] for i in picks]
+    return info["ch_names"][picks[int(np.argmax(y))]]
 
 
 def ica_rank(raw: mne.io.BaseRaw) -> int:
@@ -451,9 +345,8 @@ def ica_rank(raw: mne.io.BaseRaw) -> int:
     The number of EEG channels, less one after an average reference and in
     general the rank of the data, estimated from the data: a reference
     applied to the data (not as a projector) removes a dimension the
-    metadata does not record. The relative tolerance ignores the float32
-    rounding of the g.Pype filter, which leaves ~1e-7 of noise in that
-    missing dimension.
+    metadata does not record. The relative tolerance ignores the float
+    rounding left in that missing dimension.
     """
     eeg = raw.copy().pick("eeg")
     return int(mne.compute_rank(eeg, rank=None, tol=1e-4, tol_kind="relative",
@@ -461,17 +354,21 @@ def ica_rank(raw: mne.io.BaseRaw) -> int:
 
 
 def fit_ica(raw: mne.io.BaseRaw, n_components: int | None = None,
-            seed: int = 0) -> ICAResult:
-    """Extended-Infomax ICA of the EEG channels.
+            segment: tuple[float, float] | None = None, seed: int = 0) -> ICAResult:
+    """Extended-Infomax ICA of the EEG channels, with suggested labels.
 
-    ``n_components`` defaults to the number of EEG channels and is capped
-    at the rank of the data (see ``ica_rank``): a component beyond it
-    would only model rounding noise, and makes the fit slow and unstable.
+    The fit, the explained variance and the labels use only ``segment``
+    (start and end in s from the start of ``raw``, e.g. from the first to
+    the last trigger); the component time courses cover the whole of
+    ``raw``. ``n_components`` defaults to the number of EEG channels and is
+    capped at the rank of the data (see ``ica_rank``). Labels come from MNE's
+    detectors on the EEG alone: ``find_bads_eog`` with the most anterior EEG
+    electrode standing in for an EOG channel ("Eye blink"), and
+    ``find_bads_muscle`` ("Muscle (EMG)"); everything else is "EEG". A
+    guess to check, not a classification.
     """
-    from scipy import stats
-    from scipy.signal import welch
-
-    eeg = raw.copy().pick("eeg")
+    whole = raw.copy().pick("eeg")
+    eeg = crop(whole, *segment) if segment else whole
     rank = ica_rank(eeg)
     n_components = min(n_components or len(eeg.ch_names), rank)
     if n_components < 2:
@@ -481,62 +378,35 @@ def fit_ica(raw: mne.io.BaseRaw, n_components: int | None = None,
         n_components=n_components, method="infomax", fit_params=dict(extended=True),
         random_state=seed, max_iter="auto", verbose="error")
     ica.fit(training, verbose="error")
-    sources = ica.get_sources(eeg).get_data()
-    patterns = ica.get_components()  # (n_channels, n_components)
     n = ica.n_components_
-    sfreq = raw.info["sfreq"]
-
-    # Share of the EEG variance each component accounts for: the variance
-    # of the EEG reconstructed from that component alone, over the total.
-    total = eeg.get_data().var(axis=1).sum()
+    sources = ica.get_sources(whole).get_data()
     explained = np.array([
-        ica.apply(eeg.copy(), include=[i], exclude=[], verbose="error")
-        .get_data().var(axis=1).sum() for i in range(n)]) / total
+        ica.get_explained_variance_ratio(eeg, components=[i], ch_type="eeg")["eeg"]
+        for i in range(n)])
 
-    # Scalp map: weight at the most anterior electrodes (top quarter of the
-    # front-back range) relative to the largest weight, 0-1 (1: the map
-    # peaks at the front), and how much
-    # of the map sits on a single electrode.
-    weights = np.abs(patterns)
-    focality = weights.max(axis=0) / weights.sum(axis=0)
-    locs = np.array([ch["loc"][:3] for ch in eeg.info["chs"]])
-    frontality = np.full(n, np.nan)
-    if np.isfinite(locs).all() and np.ptp(locs[:, 1]) > 0:
-        y = locs[:, 1]
-        front = y >= y.max() - 0.25 * np.ptp(y)
-        frontality = weights[front].mean(axis=0) / weights.max(axis=0)
-
-    # Spectrum of each time course.
-    freqs, psd = welch(sources, fs=sfreq, nperseg=min(sources.shape[1], int(2 * sfreq)))
-    band = (freqs >= 1) & (freqs <= 40)
-    high_freq = psd[:, band & (freqs > 20)].sum(axis=1) / psd[:, band].sum(axis=1)
-    line_ratio = np.zeros(n)
-    for f0 in (50.0, 60.0):
-        if f0 + 4 < sfreq / 2:
-            peak = psd[:, np.abs(freqs - f0) <= 1].mean(axis=1)
-            around = psd[:, (np.abs(freqs - f0) > 2) & (np.abs(freqs - f0) <= 6)].mean(axis=1)
-            line_ratio = np.maximum(line_ratio, peak / around)
-
-    win = int(KURTOSIS_WINDOW * sfreq)
-    if sources.shape[1] >= 2 * win:
-        n_win = sources.shape[1] // win
-        windows = sources[:, :n_win * win].reshape(n, n_win, win)
-        kurtosis = np.median(stats.kurtosis(windows, axis=2), axis=1)
+    labels = ["EEG"] * n
+    blink_score = np.full(n, np.nan)
+    front = frontal_channel(eeg.info)
+    if front is not None:
+        blinks, blink_score = ica.find_bads_eog(
+            eeg, ch_name=front, measure="correlation", threshold=BLINK_CORRELATION,
+            verbose="error")
+        blink_score = np.asarray(blink_score, dtype=float)
     else:
-        kurtosis = stats.kurtosis(sources, axis=1)
-    transient_ms = np.array([_transient_ms(s, sfreq) for s in sources])
-    robust_sd = 1.4826 * np.median(
-        np.abs(sources - np.median(sources, axis=1, keepdims=True)), axis=1)
-    outlier_ratio = sources.var(axis=1) / np.maximum(robust_sd, 1e-30) ** 2
-    labels = [suggest_label(frontality[i], focality[i], kurtosis[i], high_freq[i],
-                            line_ratio[i], explained[i], len(eeg.ch_names),
-                            transient_ms[i], outlier_ratio[i])
-              for i in range(n)]
-    return ICAResult(ica=ica, sources=sources, sfreq=sfreq, explained=explained,
-                     frontality=frontality, focality=focality, kurtosis=kurtosis,
-                     high_freq=high_freq, line_ratio=line_ratio,
-                     transient_ms=transient_ms, outlier_ratio=outlier_ratio,
-                     labels=labels)
+        blinks = []
+    try:
+        muscles, muscle_score = ica.find_bads_muscle(eeg, threshold=MUSCLE_SCORE,
+                                                     verbose="error")
+        muscle_score = np.asarray(muscle_score, dtype=float)
+    except Exception:  # e.g. no electrode positions
+        muscles, muscle_score = [], np.full(n, np.nan)
+    for i in muscles:
+        labels[i] = "Muscle (EMG)"
+    for i in blinks:
+        labels[i] = "Eye blink"
+    return ICAResult(ica=ica, sources=sources, sfreq=raw.info["sfreq"],
+                     explained=explained, frontal_channel=front,
+                     blink_score=blink_score, muscle_score=muscle_score, labels=labels)
 
 
 def remove_components(raw: mne.io.BaseRaw, ica: mne.preprocessing.ICA,
@@ -545,15 +415,33 @@ def remove_components(raw: mne.io.BaseRaw, ica: mne.preprocessing.ICA,
     return ica.apply(raw.copy(), exclude=list(exclude), verbose="error")
 
 
-def component_spectrogram(source: np.ndarray, sfreq: float, fmax: float = 40.0):
-    """Time-frequency power of a component: (freqs, times, power in dB)."""
-    from scipy.signal import spectrogram
+@dataclass
+class ComponentProperties:
+    """What MNE's ``ICA.plot_properties`` shows for a continuous recording."""
 
-    nperseg = int(2 * sfreq)
-    freqs, times, power = spectrogram(source, fs=sfreq, nperseg=nperseg,
-                                      noverlap=nperseg // 2, scaling="density")
-    keep = freqs <= fmax
-    return freqs[keep], times, 10 * np.log10(power[keep] + 1e-30)
+    segments: np.ndarray  # (n_segments, n_components, n_times): 2-s segments
+    times: np.ndarray  # s within a segment
+    freqs: np.ndarray
+    psd_db: np.ndarray  # (n_segments, n_components, n_freqs), dB re 1 AU²/Hz
+    lowpass: float | None  # the recording's low-pass edge, if below Nyquist
+
+
+def component_properties(ica: mne.preprocessing.ICA,
+                         raw: mne.io.BaseRaw) -> ComponentProperties:
+    """The component time courses cut into consecutive 2-s segments, and
+    their spectra, as ``ICA.plot_properties`` computes them: multitaper
+    PSD up to 1.25 times the low-pass edge (or Nyquist)."""
+    sources = ica.get_sources(raw)
+    segments = mne.make_fixed_length_epochs(sources, duration=2.0, preload=True,
+                                            verbose="error")
+    nyquist = raw.info["sfreq"] / 2
+    lowpass = raw.info["lowpass"]
+    spectrum = segments.compute_psd(picks="all", fmax=min(lowpass * 1.25, nyquist),
+                                    verbose="error")
+    psds, freqs = spectrum.get_data(return_freqs=True, picks="all", exclude=[])
+    return ComponentProperties(
+        segments=segments.get_data(picks="all"), times=segments.times, freqs=freqs,
+        psd_db=10 * np.log10(psds), lowpass=lowpass if lowpass < nyquist else None)
 
 
 # ---------------------------------------------------------------------------
@@ -644,7 +532,10 @@ def cluster_trials(epochs: mne.Epochs, condition: str, channels) -> np.ndarray:
     Returns:
         ``(n_trials, n_times)``.
     """
-    return epochs[condition].get_data(picks=list(channels)).mean(axis=1) * 1e6
+    picks = [epochs.ch_names.index(c) for c in channels]
+    roi = mne.channels.combine_channels(epochs[condition], {"roi": picks},
+                                        method="mean", verbose="error")
+    return roi.get_data()[:, 0] * 1e6
 
 
 @dataclass
@@ -655,7 +546,6 @@ class ConditionSummary:
     sem: float
     peak_amp: float  # µV, on the condition's average ERP
     peak_latency: float  # s
-    peak_at_edge: bool  # no clear peak inside the window
     trial_amps: np.ndarray  # per-trial window means, µV
 
 
@@ -665,14 +555,10 @@ class ComparisonResult:
     a: ConditionSummary
     b: ConditionSummary
     diff: float  # mean_amp a - b
-    t: float
+    t: float  # Welch t-test of the window mean amplitudes
     df: float
-    p_welch: float
-    p_perm: float
-    n_perm: int
-    hedges_g: float
+    p: float  # two-sided
     latency_diff: float  # s, a - b, from the average ERPs
-    latency_p: float  # jackknife test of the latency difference; nan if untestable
     times: np.ndarray
     erp_a: np.ndarray  # (n_times,) µV
     erp_b: np.ndarray
@@ -680,50 +566,15 @@ class ComparisonResult:
     se_b: np.ndarray
 
 
-def _peak(erp: np.ndarray, times: np.ndarray, comp: Component) -> tuple[float, float]:
-    win = (times >= comp.tmin) & (times <= comp.tmax)
-    seg = erp[win] * comp.polarity
-    i = int(np.argmax(seg))
-    return float(erp[win][i]), float(times[win][i])
-
-
-def _at_edge(latency: float, comp: Component, times: np.ndarray) -> bool:
-    """A 'peak' on the window boundary is a slope, not a peak."""
-    step = times[1] - times[0]
-    return latency - comp.tmin < step / 2 or comp.tmax - latency < step / 2
-
-
-def _welch(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
-    from scipy import stats
-
-    res = stats.ttest_ind(x, y, equal_var=False)
-    vx, vy = x.var(ddof=1) / len(x), y.var(ddof=1) / len(y)
-    df = (vx + vy) ** 2 / (vx**2 / (len(x) - 1) + vy**2 / (len(y) - 1))
-    return float(res.statistic), float(df), float(res.pvalue)
-
-
-def _jackknife_latency(xa, xb, times, comp) -> tuple[float, float]:
-    """Peak-latency difference and its jackknife p (Miller et al., 1998).
-
-    Single-trial peak latencies are too noisy; the jackknife measures the
-    peak on leave-one-out averages and corrects the t statistic for the
-    reduced variance of those averages.
-    """
-    from scipy import stats
-
-    def loo(x):
-        total = x.sum(0)
-        return np.array([_peak((total - xi) / (len(x) - 1), times, comp)[1] for xi in x])
-
-    la, lb = loo(xa), loo(xb)
-    na, nb = len(xa), len(xb)
-    d = _peak(xa.mean(0), times, comp)[1] - _peak(xb.mean(0), times, comp)[1]
-    se = np.sqrt((na - 1) / na * ((la - la.mean()) ** 2).sum()
-                 + (nb - 1) / nb * ((lb - lb.mean()) ** 2).sum())
-    if se == 0:
-        return d, float("nan")
-    t = d / se
-    return d, float(2 * stats.t.sf(abs(t), na + nb - 2))
+def _peak(epochs: mne.Epochs, condition: str, channels, comp: Component):
+    """(amplitude µV, latency s) of the peak of the condition's average ERP."""
+    picks = [epochs.ch_names.index(c) for c in channels]
+    roi = mne.channels.combine_channels(epochs[condition].average(), {"roi": picks},
+                                        method="mean", verbose="error")
+    _, latency, amplitude = roi.get_peak(
+        tmin=comp.tmin, tmax=comp.tmax, mode="neg" if comp.polarity < 0 else "pos",
+        return_amplitude=True, strict=False)
+    return float(amplitude) * 1e6, float(latency)
 
 
 def compare_conditions(
@@ -731,15 +582,16 @@ def compare_conditions(
     a: str,
     b: str,
     comp: Component,
-    n_perm: int = 5000,
-    seed: int = 0,
 ) -> ComparisonResult:
     """Compare two conditions on ``comp`` across trials.
 
-    Window mean amplitude: Welch t-test, two-sided label-permutation test
-    and Hedges' g. Peak amplitude and latency come from the average ERPs;
-    the latency difference is tested with the jackknife.
+    The window mean amplitude of each trial is compared with a two-sided
+    Welch t-test (SciPy: MNE has no Welch test with a p-value). Peak
+    amplitude and latency come from each condition's average ERP
+    (``Evoked.get_peak``).
     """
+    from scipy import stats
+
     channels = [c for c in comp.channels if c in epochs.ch_names]
     if not channels:
         raise ValueError(f"None of {list(comp.channels)} are among the epoch channels.")
@@ -755,34 +607,18 @@ def compare_conditions(
 
     def summary(name, x):
         amps = x[:, win].mean(1)
-        pk, lat = _peak(x.mean(0), times, comp)
+        pk, lat = _peak(epochs, name, channels, comp)
         return ConditionSummary(name, len(x), float(amps.mean()),
-                                float(amps.std(ddof=1) / np.sqrt(len(x))), pk, lat,
-                                _at_edge(lat, comp, times), amps)
+                                float(amps.std(ddof=1) / np.sqrt(len(x))), pk, lat, amps)
 
     sa, sb = summary(a, xa), summary(b, xb)
-    t, df, p = _welch(sa.trial_amps, sb.trial_amps)
-
-    rng = np.random.default_rng(seed)
-    pooled = np.concatenate([sa.trial_amps, sb.trial_amps])
-    observed = sa.mean_amp - sb.mean_amp
-    perms = np.array([rng.permutation(len(pooled)) for _ in range(n_perm)])
-    shuffled = pooled[perms]
-    null = shuffled[:, : sa.n].mean(1) - shuffled[:, sa.n:].mean(1)
-    p_perm = (np.sum(np.abs(null) >= abs(observed)) + 1) / (n_perm + 1)
-
-    sd = np.sqrt(((sa.n - 1) * sa.trial_amps.var(ddof=1)
-                  + (sb.n - 1) * sb.trial_amps.var(ddof=1)) / (sa.n + sb.n - 2))
-    g = observed / sd * (1 - 3 / (4 * (sa.n + sb.n) - 9)) if sd else 0.0
-
-    lat_d, lat_p = _jackknife_latency(xa, xb, times, comp)
-    if sa.peak_at_edge or sb.peak_at_edge:
-        lat_p = float("nan")  # latency is undefined without a peak in both
+    welch = stats.ttest_ind(sa.trial_amps, sb.trial_amps, equal_var=False)
 
     return ComparisonResult(
         component=Component(comp.name, comp.tmin, comp.tmax, tuple(channels), comp.polarity),
-        a=sa, b=sb, diff=observed, t=t, df=df, p_welch=p, p_perm=float(p_perm),
-        n_perm=n_perm, hedges_g=float(g), latency_diff=lat_d, latency_p=lat_p,
+        a=sa, b=sb, diff=sa.mean_amp - sb.mean_amp, t=float(welch.statistic),
+        df=float(welch.df), p=float(welch.pvalue),
+        latency_diff=sa.peak_latency - sb.peak_latency,
         times=times, erp_a=xa.mean(0), erp_b=xb.mean(0),
         se_a=xa.std(0, ddof=1) / np.sqrt(len(xa)), se_b=xb.std(0, ddof=1) / np.sqrt(len(xb)),
     )

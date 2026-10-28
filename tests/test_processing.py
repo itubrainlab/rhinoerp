@@ -1,7 +1,6 @@
 import mne
 import numpy as np
 import pytest
-from scipy.signal import butter, sosfiltfilt, tf2sos
 
 from rhino_erp import processing as P
 
@@ -32,24 +31,19 @@ def test_trigger_channel_events(raw, recording):
     events, event_id = P.find_events(raw, "TRIG")
     assert events[:, 2].tolist() == recording[1]
     assert event_id == {"20": 20, "30": 30}
-    # Same events as MNE's own reader once the channel is typed as stim.
-    stim = raw.copy()
-    stim.set_channel_types({"TRIG": "stim"}, verbose="error")
-    stim.apply_function(lambda x: np.round(x), picks="TRIG")  # as the exported script does
-    expected = mne.find_events(stim, "TRIG", shortest_event=1, consecutive=True,
-                               verbose="error")
-    assert np.array_equal(events, expected)
+    # A recording that starts on an event keeps it.
+    cropped = P.crop(raw, events[0, 0] / raw.info["sfreq"], raw.times[-1])
+    assert P.find_events(cropped, "TRIG")[0][0, 0] == events[0, 0]
 
 
-def test_gpype_filter_is_zero_phase_butterworth(raw):
-    x = raw.get_data(picks=["EEG 1", "EEG 6"])
-    sf = raw.info["sfreq"]
-    out = P.gpype_filter(x, sf, ["a", "b"], P.FilterSettings(0.1, 30, 50, 4))
-    expected = (x - x.mean(axis=1, keepdims=True)).astype(np.float32)
-    for order, band, kind in ((4, [0.1, 30], "bandpass"), (2, [48, 52], "bandstop")):
-        b, a = butter(order, np.array(band) / (sf / 2), kind)
-        expected = sosfiltfilt(tf2sos(b, a), expected, axis=1).astype(np.float32)
-    assert np.array_equal(out, expected)
+def test_filter_is_mne_butterworth(raw):
+    out = P.apply_filter(raw, P.FilterSettings(0.1, 30, 50, 4))
+    expected = raw.copy()
+    expected.filter(0.1, 30, method="iir", iir_params=dict(ftype="butter", order=4),
+                    verbose="error")
+    expected.filter(52, 48, method="iir", iir_params=dict(ftype="butter", order=2),
+                    verbose="error")
+    assert np.array_equal(out.get_data(), expected.get_data())
 
 
 def test_shift_and_group_events():
@@ -71,15 +65,17 @@ def test_statistics_find_the_simulated_n170(raw, prepared):
     epochs, evokeds = P.compute_erps(prepared, events, {"20": 20, "30": 30},
                                      P.EpochSettings(-0.2, 0.6, (None, 0.0), None))
     assert set(evokeds) == {"20", "30"}
-    result = P.compare_conditions(epochs, "30", "20", P.COMPONENT_PRESETS["N170"],
-                                  n_perm=1000)
+    result = P.compare_conditions(epochs, "30", "20", P.COMPONENT_PRESETS["N170"])
     assert result.component.channels == ("PO7", "PO8")
-    assert result.diff < -4 and result.p_welch < 0.001 and result.p_perm < 0.01
-    assert abs(result.a.peak_latency - 0.17) < 0.012 and not result.a.peak_at_edge
-    # Same seed, same permutation p.
-    again = P.compare_conditions(epochs, "30", "20", P.COMPONENT_PRESETS["N170"],
-                                 n_perm=1000)
-    assert again.p_perm == result.p_perm
+    assert result.diff < -4 and result.t < -5 and result.p < 0.001 and result.df > 0
+    assert abs(result.a.peak_latency - 0.17) < 0.012
+
+
+def test_ica_fit_segment(raw, prepared):
+    events, _ = P.find_events(raw, "TRIG")
+    segment = P.event_time_range(prepared, events)
+    result = P.fit_ica(prepared, segment=segment)
+    assert result.sources.shape == (result.n_components, prepared.n_times)
 
 
 def test_ica_component_count(prepared):
@@ -99,22 +95,4 @@ def test_ica_labels_and_removes_the_blinks(prepared):
     cleaned = P.remove_components(prepared, result.ica, blinks)
     # Blinks dominate Fz; removing the component removes most of its variance.
     assert cleaned.get_data(picks="Fz").std() < 0.3 * fz.std()
-    freqs, times, power = P.component_spectrogram(result.sources[blinks[0]], result.sfreq)
-    assert power.shape == (len(freqs), len(times)) and freqs[-1] <= 40
-
-
-def test_suggested_labels():
-    assert P.suggest_label(1.0, 0.3, 10, 0.05, 1, 0.1, 8, 300, 1.5) == "Eye blink"
-    assert P.suggest_label(1.0, 0.3, 10, 0.05, 1, 0.002, 8, 300, 1.5) == "EEG"  # too small
-    assert P.suggest_label(0.7, 0.3, 10, 0.05, 1, 0.1, 8, 300, 1.5) == "EEG"  # peak not frontal
-    assert P.suggest_label(1.0, 0.3, 10, 0.05, 1, 0.1, 8, 40, 1.5) == "EEG"  # too brief
-    assert P.suggest_label(0.2, 0.3, 1, 0.6, 1, 0.1, 8, np.nan, 1.5) == "Muscle (EMG)"
-    assert P.suggest_label(0.2, 0.3, 1, 0.1, 20, 0.1, 8, np.nan, 1.5) == "Line noise"
-    assert P.suggest_label(0.0, 0.8, 50, 0.0, 1, 0.1, 8, 300, 1.5) == "Channel noise"
-    # Spiky but spread out: brief pops are channel noise, the rest "Other".
-    assert P.suggest_label(0.2, 0.3, 240, 0.0, 1, 0.8, 8, 90, 1.5) == "Channel noise"
-    assert P.suggest_label(0.5, 0.3, 120, 0.0, 1, 0.01, 8, 480, 1.5) == "Other"
-    # Calm most of the time, but rare large events carry the variance.
-    assert P.suggest_label(0.2, 0.3, 1, 0.0, 1, 0.8, 8, 90, 600) == "Channel noise"
-    assert P.suggest_label(0.2, 0.3, 1, 0.0, 1, 0.8, 8, 2600, 600) == "Other"
-    assert P.suggest_label(0.3, 0.3, 1, 0.1, 1, 0.1, 8, np.nan, 1.5) == "EEG"
+    assert result.frontal_channel == "Fz" and abs(result.blink_score[blinks[0]]) > 0.8
