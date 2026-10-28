@@ -44,6 +44,14 @@ def test_load_defaults(window):
 def test_workflow_and_exported_script(window, tmp_path, monkeypatch):
     window.cmb_ref.setCurrentText("average")
     window.preprocess()
+    window.fit_ica()
+    # Every component starts selected; untick the one labelled as a blink.
+    assert len(window._selected_components()) == window.ica.n_components
+    blink = window._component_labels().index("Eye blink")
+    window.tbl_ica.item(blink, 0).setCheckState(Qt.Unchecked)
+    window.apply_ica()
+    assert window._current_raw() is window.raw_clean
+    assert window.raw_clean.get_data(picks="Fz").std() < 0.5 * window.raw_pre.get_data(picks="Fz").std()
     window.spn_reject.setValue(0)
     window.spn_delay.setValue(8)
     window.compute_erps()
@@ -61,6 +69,9 @@ def test_workflow_and_exported_script(window, tmp_path, monkeypatch):
     monkeypatch.setattr(QFileDialog, "getSaveFileName",
                         staticmethod(lambda *a, **k: (str(script), "")))
     window.export_script()
+    assert (tmp_path / "analysis-ica.fif").exists()
+    text = script.read_text()
+    assert "REMOVED_COMPONENTS = [%d]" % blink in text and "Eye blink" in text
     monkeypatch.setattr(plt, "show", lambda *a, **k: None)
     ns = runpy.run_path(str(script))
     plt.close("all")

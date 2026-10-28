@@ -7,7 +7,7 @@ not need one), so the script reads top to bottom like a methods section.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -47,6 +47,9 @@ class AnalysisConfig:
     component: Component | None  # None: topographic maps only
     topomap_latency: float  # used when there is no component
     topomap_ok: bool  # at least 3 EEG channels with positions
+    ica_file: str | None = None  # the ICA fitted in the app, saved by the export
+    ica_exclude: list[int] = field(default_factory=list)  # components to remove
+    ica_labels: dict[int, str] = field(default_factory=dict)  # their labels
 
 
 def _py(value) -> str:
@@ -75,6 +78,10 @@ def build_script(cfg: AnalysisConfig) -> str:
         "2. Keep the selected channels, name them after their electrodes and add",
         "   standard 10-05 electrode positions.",
         "3. Re-reference (optional) and filter.",
+    ]
+    if cfg.ica_file:
+        steps.append("   Remove the independent components rejected on inspection.")
+    steps += [
         "4. Cut epochs around the events and average them into ERPs.",
     ]
     if comp:
@@ -121,6 +128,15 @@ def build_script(cfg: AnalysisConfig) -> str:
         add(f"HIGHPASS, LOWPASS = {_py(cfg.highpass)}, {_py(cfg.lowpass)}")
     if cfg.notch:
         add(f"LINE_NOISE = {_py(cfg.notch)}  # Hz, removed with a +-2 Hz band-stop")
+    if cfg.ica_file:
+        add("")
+        add("# ICA: the decomposition fitted in Rhino ERP (extended Infomax on the EEG")
+        add("# channels, high-passed at 1 Hz), saved next to this script, and the")
+        add("# components removed after visual inspection:")
+        for i in cfg.ica_exclude:
+            add(f"#   IC{i:02d}: {cfg.ica_labels.get(i, 'removed')}")
+        add(f"ICA_FILE = {cfg.ica_file!r}")
+        add(f"REMOVED_COMPONENTS = {cfg.ica_exclude!r}")
     add("")
     add("# Epochs (s) and artifact rejection")
     add(f"TMIN, TMAX = {_py(cfg.tmin)}, {_py(cfg.tmax)}")
@@ -182,7 +198,8 @@ def build_script(cfg: AnalysisConfig) -> str:
         "MNE 1.13\n")
 
     # ---------------------------------------------------------------- 3. filter
-    add(_section("3. Reference and filters"))
+    add(_section("3. Reference, filters and ICA" if cfg.ica_file
+                 else "3. Reference and filters"))
     if cfg.reference != "none":
         add("raw.set_eeg_reference(REFERENCE)")
     if cfg.highpass or cfg.lowpass or cfg.notch:
@@ -193,6 +210,11 @@ def build_script(cfg: AnalysisConfig) -> str:
         add("# A band-stop is a filter whose low edge lies above its high edge.")
         add('raw.filter(LINE_NOISE + 2, LINE_NOISE - 2, method="iir",')
         add('           iir_params=dict(ftype="butter", order=2))')
+    if cfg.ica_file:
+        add("")
+        add("# Reconstruct the EEG from the remaining components.")
+        add("ica = mne.preprocessing.read_ica(ICA_FILE)")
+        add("ica.apply(raw, exclude=REMOVED_COMPONENTS)")
     add("")
 
     # ---------------------------------------------------------------- 4. epochs

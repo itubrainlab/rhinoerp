@@ -64,13 +64,22 @@ them to the release when a `v*` tag is pushed.
    recording reference; or the average of the selected EEG channels, one EEG channel,
    or the mean of two such as linked mastoids), then high-pass, low-pass and
    line-noise notch, run as a zero-phase g.Pype batch pipeline.
-4. **Trigger and events** – choose the trigger channel (any channel, e.g. `TRIG` or
+4. **Independent components (ICA, optional)** – *Fit ICA* decomposes the filtered EEG
+   (extended Infomax on the EEG channels only, high-passed at 1 Hz for the fit; no EOG
+   channel is used). The *ICA* tab shows every component with its scalp map, time
+   course and time–frequency power, and a suggested label (EEG, Eye blink, Muscle
+   (EMG), Line noise, Channel noise, Other) from EEG-only features: frontal weighting,
+   spikiness (kurtosis), share of power above 20 Hz, line-noise peak and focality.
+   Labels can be changed. All components start selected; untick the ones to remove and
+   click *Reconstruct from selected*. Later steps then use the reconstructed signal
+   (also shown as *ICA cleaned* in the *Signals* tab); *Undo* goes back.
+5. **Trigger and events** – choose the trigger channel (any channel, e.g. `TRIG` or
    BioSemi `Status`, or the file's annotations) and the bit mask, then *Find events*.
    Tick the codes to analyse and name them; codes sharing a name are pooled.
    **EEG delay** (slider or ms box, ±500 ms) compensates a recording delay between
    triggers and EEG: a positive value means the EEG lags, so events are moved later.
    It applies to the epochs and the event markers, and computed ERPs update live.
-5. **Epochs and ERPs** – set the window, baseline and peak-to-peak rejection, then
+6. **Epochs and ERPs** – set the window, baseline and peak-to-peak rejection, then
    compute. The panel reports which channels caused rejections. The *Epochs* tab shows
    a single channel, the mean of selected channels, GFP or a butterfly plot; click the
    plot to set the topomap latency. ERPs can be saved as an MNE `-ave.fif` file.
@@ -78,13 +87,15 @@ them to the release when a `v*` tag is pushed.
    SciPy, matplotlib; no g.Pype) that reproduces the configured analysis. It starts
    with an editable settings block, then runs numbered steps: load and find events,
    channels and positions, reference and filters (MNE's zero-phase IIR Butterworth;
-   the app's g.Pype filter differs by well under 0.1 µV), epochs, and - when a
+   the app's g.Pype filter differs by well under 0.1 µV), ICA reconstruction (the
+   fitted ICA is saved next to the script as `<script>-ica.fif`, with the removed
+   components and their labels), epochs, and - when a
    component is set up in the *Statistics* tab - topographic maps of the component
    window (each condition and their difference) plus the same statistics as the app
    (Welch t-test, permutation test, Hedges' g, peaks, jackknife latency test) and a
    graph of both conditions with the window and peaks. Only the steps the
    configuration needs are written.
-6. **Statistics** (tab) – define the ERP component to test: pick a preset (P1, N1,
+7. **Statistics** (tab) – define the ERP component to test: pick a preset (P1, N1,
    N170, P2, N2, MMN, P300, N400, LPP) or edit the name, time window, polarity and
    channel cluster freely (any edit makes it *Custom*). Choose two conditions and run:
    - **window mean amplitude**: Welch t-test, label-permutation test, Hedges' g;

@@ -326,6 +326,145 @@ def apply_filter(raw: mne.io.BaseRaw, settings: FilterSettings) -> mne.io.BaseRa
 
 
 # ---------------------------------------------------------------------------
+# Independent component analysis (EEG channels only, no EOG)
+
+
+#: ICA is fitted on a copy high-passed at this frequency: slow drifts
+#: otherwise dominate the decomposition. The fit is then applied to the
+#: data as filtered in step 3.
+ICA_HIGHPASS = 1.0
+
+#: Labels a component can be given. The first is the default guess.
+COMPONENT_LABELS = ("EEG", "Eye blink", "Muscle (EMG)", "Line noise",
+                    "Channel noise", "Other")
+
+
+@dataclass
+class ICAResult:
+    ica: mne.preprocessing.ICA
+    sources: np.ndarray  # (n_components, n_times) component time courses
+    sfreq: float
+    explained: np.ndarray  # fraction of EEG variance per component
+    frontality: np.ndarray  # weight at the most anterior electrodes, 0-1
+    focality: np.ndarray  # largest channel weight over the sum of weights
+    kurtosis: np.ndarray  # excess kurtosis of each time course
+    high_freq: np.ndarray  # share of 1-40 Hz power above 20 Hz
+    line_ratio: np.ndarray  # power at 50/60 Hz over its neighbourhood
+    labels: list[str]  # suggested label per component
+
+    @property
+    def n_components(self) -> int:
+        return len(self.explained)
+
+
+def suggest_label(frontality, focality, kurtosis, high_freq, line_ratio,
+                  explained, n_channels) -> str:
+    """A first guess at what a component is, from the EEG alone.
+
+    Eye blinks project to the front of the head and are large, brief,
+    slow deflections; muscle activity is broadband and strong above
+    20 Hz; line noise is a narrow peak at 50 or 60 Hz; a component that
+    sits on a single electrode is usually that electrode's noise. The rest
+    is taken to be brain activity. A blink component must also carry at
+    least 1% of the variance. A guess to check, not a classification.
+    """
+    if (np.isfinite(frontality) and frontality >= 0.7 and kurtosis > 5
+            and high_freq < 0.3 and explained >= 0.01):
+        return "Eye blink"
+    if line_ratio > 5:
+        return "Line noise"
+    if high_freq > 0.4:
+        return "Muscle (EMG)"
+    if n_channels >= 4 and focality > 0.45:
+        return "Channel noise"
+    return "EEG"
+
+
+def fit_ica(raw: mne.io.BaseRaw, seed: int = 0) -> ICAResult:
+    """Extended-Infomax ICA of the EEG channels.
+
+    The number of components is the rank of the EEG data (one fewer than
+    the channels after an average reference).
+    """
+    from scipy import stats
+    from scipy.signal import welch
+
+    eeg = raw.copy().pick("eeg")
+    # Estimated from the data: an average reference applied to the data
+    # (not as a projector) removes a dimension the metadata does not record.
+    # The relative tolerance ignores the float32 rounding of the g.Pype
+    # filter, which leaves ~1e-7 of noise in that missing dimension.
+    rank = mne.compute_rank(eeg, rank=None, tol=1e-4, tol_kind="relative",
+                            verbose="error")["eeg"]
+    if rank < 2:
+        raise ValueError("ICA needs at least 2 EEG channels.")
+    training = eeg.copy().filter(ICA_HIGHPASS, None, verbose="error")
+    ica = mne.preprocessing.ICA(
+        n_components=rank, method="infomax", fit_params=dict(extended=True),
+        random_state=seed, max_iter="auto", verbose="error")
+    ica.fit(training, verbose="error")
+    sources = ica.get_sources(eeg).get_data()
+    patterns = ica.get_components()  # (n_channels, n_components)
+    n = ica.n_components_
+    sfreq = raw.info["sfreq"]
+
+    # Share of the EEG variance each component accounts for: the variance
+    # of the EEG reconstructed from that component alone, over the total.
+    total = eeg.get_data().var(axis=1).sum()
+    explained = np.array([
+        ica.apply(eeg.copy(), include=[i], exclude=[], verbose="error")
+        .get_data().var(axis=1).sum() for i in range(n)]) / total
+
+    # Scalp map: weight at the most anterior electrodes (top quarter of the
+    # front-back range) relative to the largest weight, 0-1, and how much
+    # of the map sits on a single electrode.
+    weights = np.abs(patterns)
+    focality = weights.max(axis=0) / weights.sum(axis=0)
+    locs = np.array([ch["loc"][:3] for ch in eeg.info["chs"]])
+    frontality = np.full(n, np.nan)
+    if np.isfinite(locs).all() and np.ptp(locs[:, 1]) > 0:
+        y = locs[:, 1]
+        front = y >= y.max() - 0.25 * np.ptp(y)
+        frontality = weights[front].mean(axis=0) / weights.max(axis=0)
+
+    # Spectrum of each time course.
+    freqs, psd = welch(sources, fs=sfreq, nperseg=min(sources.shape[1], int(2 * sfreq)))
+    band = (freqs >= 1) & (freqs <= 40)
+    high_freq = psd[:, band & (freqs > 20)].sum(axis=1) / psd[:, band].sum(axis=1)
+    line_ratio = np.zeros(n)
+    for f0 in (50.0, 60.0):
+        if f0 + 4 < sfreq / 2:
+            peak = psd[:, np.abs(freqs - f0) <= 1].mean(axis=1)
+            around = psd[:, (np.abs(freqs - f0) > 2) & (np.abs(freqs - f0) <= 6)].mean(axis=1)
+            line_ratio = np.maximum(line_ratio, peak / around)
+
+    kurtosis = stats.kurtosis(sources, axis=1)
+    labels = [suggest_label(frontality[i], focality[i], kurtosis[i], high_freq[i],
+                            line_ratio[i], explained[i], len(eeg.ch_names))
+              for i in range(n)]
+    return ICAResult(ica=ica, sources=sources, sfreq=sfreq, explained=explained,
+                     frontality=frontality, focality=focality, kurtosis=kurtosis,
+                     high_freq=high_freq, line_ratio=line_ratio, labels=labels)
+
+
+def remove_components(raw: mne.io.BaseRaw, ica: mne.preprocessing.ICA,
+                      exclude: list[int]) -> mne.io.BaseRaw:
+    """A copy of ``raw`` reconstructed from all components but ``exclude``."""
+    return ica.apply(raw.copy(), exclude=list(exclude), verbose="error")
+
+
+def component_spectrogram(source: np.ndarray, sfreq: float, fmax: float = 40.0):
+    """Time-frequency power of a component: (freqs, times, power in dB)."""
+    from scipy.signal import spectrogram
+
+    nperseg = int(2 * sfreq)
+    freqs, times, power = spectrogram(source, fs=sfreq, nperseg=nperseg,
+                                      noverlap=nperseg // 2, scaling="density")
+    keep = freqs <= fmax
+    return freqs[keep], times, 10 * np.log10(power[keep] + 1e-30)
+
+
+# ---------------------------------------------------------------------------
 # Epochs and ERPs
 
 

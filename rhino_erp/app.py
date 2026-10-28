@@ -63,7 +63,7 @@ COLORS = [
 ]
 
 #: Tab indices
-TAB_SIGNALS, TAB_EPOCHS, TAB_STATS, TAB_MONTAGE = range(4)
+TAB_SIGNALS, TAB_ICA, TAB_EPOCHS, TAB_STATS, TAB_MONTAGE = range(5)
 
 CUSTOM = "Custom"
 
@@ -101,6 +101,11 @@ class MainWindow(QMainWindow):
         self.path: str | None = None
         self.raw_orig: mne.io.BaseRaw | None = None  # selected channels, positions
         self.raw_pre: mne.io.BaseRaw | None = None  # filtered
+        self.ica: proc.ICAResult | None = None
+        self.raw_clean: mne.io.BaseRaw | None = None  # reconstructed from selected ICs
+        self._ica_excluded: list[int] = []
+        self._ica_spectra: list = []
+        self._ica_labels: list[str] = []
         self.events: np.ndarray | None = None
         self.epochs: mne.Epochs | None = None
         self.evokeds: dict[str, mne.Evoked] = {}
@@ -198,8 +203,33 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.btn_filter)
         layout.addWidget(box)
 
-        # 4. Trigger and events
-        box = QGroupBox("4. Trigger and events")
+        # 4. ICA
+        box = QGroupBox("4. Independent components (ICA, optional)")
+        lay = QVBoxLayout(box)
+        self.btn_ica = QPushButton("Fit ICA")
+        self.btn_ica.setToolTip("Decompose the filtered EEG into independent components "
+                                "(extended Infomax, EEG channels only) and inspect them "
+                                "in the ICA tab.")
+        self.btn_ica.clicked.connect(self.fit_ica)
+        lay.addWidget(self.btn_ica)
+        row = QHBoxLayout()
+        self.btn_ica_apply = QPushButton("Reconstruct from selected")
+        self.btn_ica_apply.setToolTip("Rebuild the EEG from the components ticked in the "
+                                      "ICA tab only; unticked components are removed.")
+        self.btn_ica_apply.clicked.connect(self.apply_ica)
+        self.btn_ica_reset = QPushButton("Undo")
+        self.btn_ica_reset.setToolTip("Use the filtered data with all components again.")
+        self.btn_ica_reset.clicked.connect(self.reset_ica)
+        row.addWidget(self.btn_ica_apply, 1)
+        row.addWidget(self.btn_ica_reset)
+        lay.addLayout(row)
+        self.lbl_ica = QLabel("Optional: fit after step 3.")
+        self.lbl_ica.setWordWrap(True)
+        lay.addWidget(self.lbl_ica)
+        layout.addWidget(box)
+
+        # 5. Trigger and events
+        box = QGroupBox("5. Trigger and events")
         lay = QVBoxLayout(box)
         form = QFormLayout()
         self.cmb_trigger = QComboBox()
@@ -252,8 +282,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.tbl_events)
         layout.addWidget(box)
 
-        # 5. ERPs
-        box = QGroupBox("5. Epochs and ERPs")
+        # 6. ERPs
+        box = QGroupBox("6. Epochs and ERPs")
         lay = QVBoxLayout(box)
         form = QFormLayout()
         self.spn_tmin = _spin(-2, 0, -0.2, 0.05, 3, "s")
@@ -297,7 +327,7 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(w)
         bar = QHBoxLayout()
         self.cmb_stage = QComboBox()
-        self.cmb_stage.addItems(["Raw", "Filtered"])
+        self.cmb_stage.addItems(["Raw", "Filtered", "ICA cleaned"])
         self.cmb_stage.currentIndexChanged.connect(self._plot_signals)
         self.spn_window = _spin(1, 60, 10, 1, 0, "s")
         self.spn_window.valueChanged.connect(self._plot_signals)
@@ -318,6 +348,7 @@ class MainWindow(QMainWindow):
         self.sld_time.valueChanged.connect(self._plot_signals)
         lay.addWidget(self.sld_time)
         self.tabs.addTab(w, "Signals")
+        self.tabs.addTab(self._build_ica_tab(), "ICA")
 
         # ERP tab
         w = QWidget()
@@ -527,7 +558,7 @@ class MainWindow(QMainWindow):
     def run_stats(self, quiet: bool = False):
         if not self.evokeds:
             if not quiet:
-                QMessageBox.information(self, "No ERPs", "Compute ERPs in step 5 first.")
+                QMessageBox.information(self, "No ERPs", "Compute ERPs in step 6 first.")
             return
         with self._busy("Running ERP statistics…"):
             a, b = self.cmb_cond_a.currentText(), self.cmb_cond_b.currentText()
@@ -656,6 +687,216 @@ class MainWindow(QMainWindow):
                     writer.writerow([key, value])
             self.statusBar().showMessage(f"Saved {path} and {summary_path}")
 
+    # ------------------------------------------------------------ ICA tab
+
+    def _build_ica_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("Untick components to remove, then click <b>Reconstruct "
+                             "from selected</b> in step 4."))
+        bar.addStretch(1)
+        self.spn_ica_t0 = _spin(0, 100000, 0, 5, 0, "s")
+        self.spn_ica_len = _spin(5, 120, 20, 5, 0, "s")
+        for label, wid in (("Time course from", self.spn_ica_t0),
+                           ("length", self.spn_ica_len)):
+            bar.addWidget(QLabel(label))
+            bar.addWidget(wid)
+            wid.valueChanged.connect(self._plot_ica)
+        lay.addLayout(bar)
+        body = QSplitter()
+        self.tbl_ica = QTableWidget(0, 6)
+        self.tbl_ica.setHorizontalHeaderLabels(
+            ["Component", "Label", "Var.", "Frontal", "Spiky", ">20 Hz"])
+        self.tbl_ica.verticalHeader().setVisible(False)
+        self.tbl_ica.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl_ica.setMinimumWidth(360)
+        tips = {
+            0: "Ticked components are kept; unticked ones are removed.",
+            1: "Suggested from the EEG alone; change it if the maps say otherwise.",
+            2: "Share of the EEG variance the component accounts for.",
+            3: "Weight at the most anterior electrodes relative to the largest, 0-1 "
+               "(eye blinks are frontal).",
+            4: "Kurtosis of the time course: large, brief deflections (blinks, "
+               "electrode pops) score high.",
+            5: "Share of 1-40 Hz power above 20 Hz (muscle activity is high).",
+        }
+        for col, tip in tips.items():
+            self.tbl_ica.horizontalHeaderItem(col).setToolTip(tip)
+        body.addWidget(self.tbl_ica)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self.cnv_ica = MplCanvas(4)
+        scroll.setWidget(self.cnv_ica)
+        body.addWidget(scroll)
+        body.setStretchFactor(1, 1)
+        body.setSizes([380, 640])
+        lay.addWidget(body, 1)
+        return w
+
+    def _selected_components(self) -> list[int]:
+        return [i for i in range(self.tbl_ica.rowCount())
+                if self.tbl_ica.item(i, 0).checkState() == Qt.Checked]
+
+    def _component_labels(self) -> list[str]:
+        return [self.tbl_ica.cellWidget(i, 1).currentText()
+                for i in range(self.tbl_ica.rowCount())]
+
+    def _show_ica(self):
+        """Fill the component table and draw the components (or clear both)."""
+        self.tbl_ica.setRowCount(0)
+        res = self.ica
+        if res is not None:
+            removed = set(self._ica_excluded)
+            for i in range(res.n_components):
+                self.tbl_ica.insertRow(i)
+                item = QTableWidgetItem(f"IC{i:02d}")
+                item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                item.setCheckState(Qt.Unchecked if i in removed else Qt.Checked)
+                self.tbl_ica.setItem(i, 0, item)
+                label = QComboBox()
+                label.setEditable(True)  # any label, not only the suggestions
+                label.addItems(proc.COMPONENT_LABELS)
+                label.setCurrentText(self._ica_labels[i])
+                label.currentTextChanged.connect(self._ica_label_changed)
+                self.tbl_ica.setCellWidget(i, 1, label)
+                frontal = res.frontality[i]
+                for col, text in ((2, f"{100 * res.explained[i]:.1f}%"),
+                                  (3, "–" if not np.isfinite(frontal) else f"{frontal:.2f}"),
+                                  (4, f"{res.kurtosis[i]:.0f}"),
+                                  (5, f"{100 * res.high_freq[i]:.0f}%")):
+                    cell = QTableWidgetItem(text)
+                    cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    self.tbl_ica.setItem(i, col, cell)
+            self.tbl_ica.resizeColumnsToContents()
+        self._plot_ica()
+
+    def _ica_label_changed(self, _text):
+        self._ica_labels = self._component_labels()
+        self._plot_ica()
+
+    def _plot_ica(self):
+        fig = self.cnv_ica.figure
+        fig.clear()
+        res = self.ica
+        if res is None:
+            self.cnv_ica.setMinimumHeight(0)
+            self.cnv_ica.draw_idle()
+            return
+        n = res.n_components
+        sf = res.sfreq
+        self.cnv_ica.setMinimumHeight(170 * n + 40)
+        fig.set_size_inches(fig.get_figwidth(), (170 * n + 40) / fig.dpi)
+        grid = fig.add_gridspec(n, 3, width_ratios=[1, 2.4, 2.4])
+        info = res.ica.info
+        positioned = len(proc.eeg_with_positions(info)) == len(info.ch_names) >= 3
+        patterns = res.ica.get_components()
+        a = int(self.spn_ica_t0.value() * sf)
+        b = min(res.sources.shape[1], a + int(self.spn_ica_len.value() * sf))
+        times = np.arange(a, b) / sf
+        for i in range(n):
+            ax = fig.add_subplot(grid[i, 0])
+            if positioned:
+                mne.viz.plot_topomap(patterns[:, i], info, axes=ax, show=False,
+                                     contours=0, sensors=True)
+            else:
+                ax.text(0.5, 0.5, "no electrode\npositions", ha="center", va="center",
+                        fontsize=8)
+                ax.axis("off")
+            ax.set_title(f"IC{i:02d}\n{self._ica_labels[i]}", fontsize=8,
+                         color=matplotlib.rcParams["text.color"])
+
+            ax = fig.add_subplot(grid[i, 1])
+            ax.plot(times, res.sources[i, a:b], color="#9ec5ff", lw=0.7)
+            if len(times):
+                ax.set_xlim(times[0], times[-1])
+            ax.set_yticks([])
+            ax.tick_params(labelsize=7)
+            if i == 0:
+                ax.set_title("Time course", fontsize=9)
+            if i == n - 1:
+                ax.set_xlabel("Time (s)", fontsize=8)
+
+            ax = fig.add_subplot(grid[i, 2])
+            freqs, ttimes, power = self._ica_spectra[i]
+            lo, hi = np.percentile(power, [5, 99])
+            ax.pcolormesh(ttimes, freqs, power, shading="auto", cmap="magma",
+                          vmin=lo, vmax=hi, rasterized=True)
+            ax.set_ylim(1, freqs[-1])
+            ax.set_ylabel("Hz", fontsize=7)
+            ax.tick_params(labelsize=7)
+            if i == 0:
+                ax.set_title("Time–frequency (power, dB)", fontsize=9)
+            if i == n - 1:
+                ax.set_xlabel("Time (s)", fontsize=8)
+        self.cnv_ica.draw_idle()
+
+    def fit_ica(self):
+        if self.raw_pre is None:
+            return
+        with self._busy("Fitting ICA (EEG channels only)…"):
+            had_clean = self.raw_clean is not None
+            self.ica = proc.fit_ica(self.raw_pre)
+            self._ica_spectra = [proc.component_spectrogram(s, self.ica.sfreq)
+                                 for s in self.ica.sources]
+            self._ica_labels = list(self.ica.labels)
+            self._ica_excluded = []
+            self.raw_clean = None
+            if had_clean:
+                self._invalidate("erp")
+            counts = {}
+            for label in self._ica_labels:
+                counts[label] = counts.get(label, 0) + 1
+            summary = ", ".join(f"{n} {label}" for label, n in counts.items())
+            self.lbl_ica.setText(f"{self.ica.n_components} components; review them "
+                                 "in the ICA tab.")
+            # Show the time course past the start-up drift of a recording.
+            duration = self.ica.sources.shape[1] / self.ica.sfreq
+            self.spn_ica_t0.blockSignals(True)
+            self.spn_ica_t0.setMaximum(max(0.0, duration - 5))
+            self.spn_ica_t0.setValue(min(30.0, max(0.0, duration - self.spn_ica_len.value())))
+            self.spn_ica_t0.blockSignals(False)
+            self.tabs.setCurrentIndex(TAB_ICA)
+            self.statusBar().showMessage(f"ICA: {self.ica.n_components} components "
+                                         f"({summary}).")
+        self._show_ica()
+
+    def apply_ica(self):
+        if self.ica is None:
+            return
+        kept = self._selected_components()
+        had_erps = bool(self.evokeds)
+        with self._busy("Reconstructing the signal from the selected components…"):
+            if not kept:
+                raise InputError("Select at least one component in the ICA tab.")
+            removed = [i for i in range(self.ica.n_components) if i not in kept]
+            self.raw_clean = proc.remove_components(self.raw_pre, self.ica.ica, removed)
+            self._ica_excluded = removed
+            self._invalidate("erp")
+            labels = self._component_labels()
+            names = ", ".join(f"IC{i:02d} ({labels[i]})" for i in removed) or "none"
+            self.lbl_ica.setText(f"Reconstructed from {len(kept)} of "
+                                 f"{self.ica.n_components} components.")
+            self.cmb_stage.setCurrentIndex(2)
+            self.statusBar().showMessage(f"ICA reconstruction; removed: {names}.")
+        self._plot_signals()
+        if had_erps and self.raw_clean is not None:
+            self.compute_erps(quiet=True)
+
+    def reset_ica(self):
+        had_erps = bool(self.evokeds)
+        self.raw_clean = None
+        self._ica_excluded = []
+        for i in range(self.tbl_ica.rowCount()):
+            self.tbl_ica.item(i, 0).setCheckState(Qt.Checked)
+        self._invalidate("erp")
+        self.lbl_ica.setText("Using the filtered data with all components.")
+        self.cmb_stage.setCurrentIndex(1)
+        self._update_enabled()
+        self._plot_signals()
+        if had_erps:
+            self.compute_erps(quiet=True)
+
     # ------------------------------------------------------------ helpers
 
     @contextmanager
@@ -679,6 +920,9 @@ class MainWindow(QMainWindow):
         self.btn_chans.setEnabled(loaded)
         self.btn_events.setEnabled(loaded)
         self.btn_filter.setEnabled(self.raw_orig is not None)
+        self.btn_ica.setEnabled(self.raw_pre is not None)
+        self.btn_ica_apply.setEnabled(self.ica is not None)
+        self.btn_ica_reset.setEnabled(self.raw_clean is not None)
         self.btn_erp.setEnabled(self.raw_orig is not None and self.events is not None)
         self.btn_save.setEnabled(bool(self.evokeds))
         self.btn_script.setEnabled(loaded)
@@ -688,12 +932,18 @@ class MainWindow(QMainWindow):
             self._show_stats()  # clear results that no longer match the data
 
     def _current_raw(self) -> mne.io.BaseRaw | None:
-        return self.raw_pre if self.raw_pre is not None else self.raw_orig
+        for raw in (self.raw_clean, self.raw_pre, self.raw_orig):
+            if raw is not None:
+                return raw
+        return None
 
     def _invalidate(self, from_stage: str):
         """Drop results that depend on a stage that just changed."""
         if from_stage == "pre":
             self.raw_pre = None
+            self.ica = None
+            self.raw_clean = None
+            self._show_ica()
         self.epochs = None
         self.evokeds = {}
         self.stats = None
@@ -856,7 +1106,7 @@ class MainWindow(QMainWindow):
         self._plot_signals()
 
     def _delayed_events(self) -> np.ndarray:
-        """Events moved by the EEG delay set in step 4."""
+        """Events moved by the EEG delay set in step 5."""
         return proc.shift_events(self.events, self.spn_delay.value(),
                                  self.raw_file.info["sfreq"])
 
@@ -914,7 +1164,7 @@ class MainWindow(QMainWindow):
         with self._busy("Epoching and averaging…"):
             events, event_id = self._selected_event_id()
             if not event_id:
-                raise InputError("Tick at least one event in step 4.")
+                raise InputError("Tick at least one event in step 5.")
             settings = proc.EpochSettings(
                 tmin=self.spn_tmin.value(),
                 tmax=self.spn_tmax.value(),
@@ -966,7 +1216,7 @@ class MainWindow(QMainWindow):
             raise InputError("Select at least one channel in step 2.")
         groups = self._event_groups()
         if not groups:
-            raise InputError("Tick at least one event in step 4.")
+            raise InputError("Tick at least one event in step 5.")
         raw = self.raw_file
 
         annotations = trigger == proc.ANNOTATIONS
@@ -1043,8 +1293,19 @@ class MainWindow(QMainWindow):
                                               f"{stem}_erp_analysis.py", "Python (*.py)")
         if path:
             with self._busy("Writing MNE script…"):
+                saved = path
+                if self.raw_clean is not None and self._ica_excluded:
+                    # The script reuses the fitted ICA: refitting would not
+                    # guarantee the same components in the same order.
+                    ica_file = str(Path(path).with_name(Path(path).stem + "-ica.fif"))
+                    self.ica.ica.save(ica_file, overwrite=True, verbose="error")
+                    cfg.ica_file = ica_file
+                    cfg.ica_exclude = list(self._ica_excluded)
+                    labels = self._component_labels()
+                    cfg.ica_labels = {i: labels[i] for i in self._ica_excluded}
+                    saved += f" and {Path(ica_file).name}"
                 Path(path).write_text(build_script(cfg))
-                self.statusBar().showMessage(f"Saved {path}")
+                self.statusBar().showMessage(f"Saved {saved}")
 
     def save_erps(self):
         if not self.evokeds:
@@ -1064,7 +1325,7 @@ class MainWindow(QMainWindow):
     def _plot_signals(self):
         plot = self.plt_signals
         plot.clear()
-        raw = self.raw_pre if self.cmb_stage.currentIndex() == 1 else self.raw_orig
+        raw = [self.raw_orig, self.raw_pre, self.raw_clean][self.cmb_stage.currentIndex()]
         if raw is None:
             raw = self._current_raw()
         if raw is None:

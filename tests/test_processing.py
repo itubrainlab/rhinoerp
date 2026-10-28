@@ -80,3 +80,27 @@ def test_statistics_find_the_simulated_n170(raw, prepared):
     again = P.compare_conditions(epochs, "30", "20", P.COMPONENT_PRESETS["N170"],
                                  n_perm=1000)
     assert again.p_perm == result.p_perm
+
+
+def test_ica_labels_and_removes_the_blinks(prepared):
+    result = P.fit_ica(prepared)
+    assert result.n_components == 8
+    assert np.isclose(result.explained.sum(), 1, atol=0.1)
+    assert set(result.labels) <= set(P.COMPONENT_LABELS)
+    blinks = [i for i, label in enumerate(result.labels) if label == "Eye blink"]
+    assert len(blinks) == 1
+    fz = prepared.get_data(picks="Fz")
+    cleaned = P.remove_components(prepared, result.ica, blinks)
+    # Blinks dominate Fz; removing the component removes most of its variance.
+    assert cleaned.get_data(picks="Fz").std() < 0.3 * fz.std()
+    freqs, times, power = P.component_spectrogram(result.sources[blinks[0]], result.sfreq)
+    assert power.shape == (len(freqs), len(times)) and freqs[-1] <= 40
+
+
+def test_suggested_labels():
+    assert P.suggest_label(0.9, 0.3, 20, 0.05, 1, 0.1, 8) == "Eye blink"
+    assert P.suggest_label(0.9, 0.3, 20, 0.05, 1, 0.002, 8) == "EEG"  # too small
+    assert P.suggest_label(0.2, 0.3, 1, 0.6, 1, 0.1, 8) == "Muscle (EMG)"
+    assert P.suggest_label(0.2, 0.3, 1, 0.1, 20, 0.1, 8) == "Line noise"
+    assert P.suggest_label(0.0, 0.8, 50, 0.0, 1, 0.1, 8) == "Channel noise"
+    assert P.suggest_label(0.3, 0.3, 1, 0.1, 1, 0.1, 8) == "EEG"

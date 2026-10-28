@@ -3,7 +3,9 @@
 Eight EEG channels (EEG 1-8 at the Unicorn positions Fz, C3, Cz, C4, Pz,
 PO7, Oz, PO8), accelerometer channels typed as EEG by the reader, and a
 TRIG channel with codes 20 and 30. Code 30 carries an N170-like
-negativity at PO7/PO8 that code 20 lacks, so a real effect exists.
+negativity at PO7/PO8 that code 20 lacks, so a real effect exists. Blinks,
+strongest at Fz and fading towards the back, occur every few seconds,
+unrelated to the triggers.
 """
 
 import os
@@ -18,6 +20,8 @@ SFREQ = 250
 LABELS = ["EEG 1", "EEG 2", "EEG 3", "EEG 4", "EEG 5", "EEG 6", "EEG 7", "EEG 8",
           "ACC X", "ACC Y", "TRIG"]
 PO7, PO8 = 5, 7
+#: How strongly a blink reaches each EEG channel (Fz ... PO8).
+BLINK_WEIGHTS = [1.0, 0.5, 0.55, 0.5, 0.25, 0.15, 0.1, 0.15]
 
 
 def write_recording(path, seconds=200, seed=0):
@@ -26,7 +30,9 @@ def write_recording(path, seconds=200, seed=0):
     rng = np.random.default_rng(seed)
     n = seconds * SFREQ
     t = np.arange(n) / SFREQ
-    eeg = rng.normal(0, 6, (8, n)) + 20 * np.sin(2 * np.pi * 50 * t)  # µV
+    # Laplace-distributed background: like real EEG, not Gaussian, which ICA
+    # could not separate (and would iterate on until its limit).
+    eeg = rng.laplace(0, 4, (8, n)) + 20 * np.sin(2 * np.pi * 50 * t)  # µV
     eeg += 117_000 + rng.uniform(-500, 500, (8, 1))  # the Unicorn's DC offset
     trig = np.zeros(n)
     erp_t = np.arange(int(0.6 * SFREQ)) / SFREQ
@@ -39,6 +45,9 @@ def write_recording(path, seconds=200, seed=0):
         if code == 30:
             eeg[[PO7, PO8], onset:onset + len(erp_t)] += n170
         onset += int(SFREQ * rng.uniform(1.0, 1.4))
+    blink = 150 * np.sin(np.pi * np.arange(int(0.4 * SFREQ)) / (0.4 * SFREQ)) ** 2
+    for start in rng.integers(SFREQ, n - SFREQ, seconds // 4):
+        eeg[:, start:start + len(blink)] += np.outer(BLINK_WEIGHTS, blink)
     acc = rng.normal(0, 0.01, (2, n))
     signals = list(eeg) + list(acc) + [trig]
     writer = pyedflib.EdfWriter(str(path), len(LABELS), file_type=pyedflib.FILETYPE_BDFPLUS)
