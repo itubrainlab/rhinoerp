@@ -5,8 +5,8 @@
 Run with the package's own Python against the library folder its first
 launch set up, so it checks what users get: the bundled Python, the
 libraries installed from PyPI (g.Pype, MNE, Qt) and the bundled wheel. It
-filters a synthetic recording through g.Pype, epochs it with MNE, runs
-the statistics, opens the main window and builds an MNE script.
+filters a synthetic recording, fits an ICA, epochs it, runs the statistics,
+opens the main window and builds an MNE script.
 """
 import os
 import sys
@@ -50,13 +50,16 @@ raw.set_montage("standard_1020", on_missing="ignore", verbose="error")
 found, _ = P.find_events(raw, "TRIG")
 assert found[:, 2].tolist() == events
 filtered = P.apply_filter(raw.copy().pick("eeg"), P.FilterSettings(0.1, 30, 50, 4))
-print("g.Pype filter: ok", flush=True)
+print("filter: ok", flush=True)
+ica = P.fit_ica(filtered, segment=P.event_time_range(filtered, found))
+props = P.component_properties(ica.ica, filtered)
+assert ica.n_components == 8 and props.segments.shape[1] == 8
+print(f"ICA: ok ({ica.n_components} components)", flush=True)
 epochs, evokeds = P.compute_erps(filtered, found, {"20": 20, "30": 30},
                                  P.EpochSettings(-0.2, 0.6, (None, 0.0), None))
-result = P.compare_conditions(epochs, "30", "20", P.COMPONENT_PRESETS["N170"],
-                              n_perm=500)
-assert result.diff < 0 and result.p_welch < 0.01, (result.diff, result.p_welch)
-print(f"statistics: ok (N170 {result.diff:+.1f} µV, p = {result.p_welch:.2g})",
+result = P.compare_conditions(epochs, "30", "20", P.COMPONENT_PRESETS["N170"])
+assert result.diff < 0 and result.p < 0.01, (result.diff, result.p)
+print(f"statistics: ok (N170 {result.diff:+.1f} µV, p = {result.p:.2g})",
       flush=True)
 
 app = QApplication([])
