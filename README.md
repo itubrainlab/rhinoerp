@@ -16,6 +16,8 @@ a short MNE script.
 
 ![Rhino ERP](docs/screenshot.png)
 
+![ICA tab](docs/screenshot-ica.png)
+
 ## Download
 
 Packages for Windows, macOS (Apple Silicon) and Linux are on the
